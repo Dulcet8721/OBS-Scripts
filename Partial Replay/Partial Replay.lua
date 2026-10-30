@@ -717,9 +717,6 @@ function script_unload()
         obs.obs_frontend_remove_event_callback(event_callback)
         event_callback = nil
     end
-    if not exit_in_progress and main_stopped_by_reset and not frontend_active() then
-        obs.obs_frontend_replay_buffer_start()
-    end
     force_stop_outputs()
     for _, id in ipairs(BUFFER_IDS) do
         disconnect_output_signals(id)
