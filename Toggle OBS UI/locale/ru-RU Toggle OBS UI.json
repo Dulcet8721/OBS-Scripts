@@ -1,0 +1,6 @@
+{
+  "ScriptDescription": " ",
+  "GroupHotkeys": "Настройки горячей клавиши переключения OBS UI",
+  "ScriptWindowEnabled": "Открывать окно «Скрипты» вместе с OBS",
+  "HotkeyToggleOBSUI": "Переключить OBS UI"
+}

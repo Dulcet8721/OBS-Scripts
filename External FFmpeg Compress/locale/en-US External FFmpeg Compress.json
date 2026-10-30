@@ -1,0 +1,13 @@
+{
+  "ScriptDescription": " ",
+  "GroupCompress": "Video compression",
+  "InputFile": "Select video file",
+  "CRFValue": "Compression level (CRF)",
+  "CompressButton": "Compress video file",
+  "UseHWDecoding": "Use hardware decoding",
+  "VideoFilesFilter": "Video files (*.flv *.mkv *.mp4 *.mov *.ts);;All files (*.*)",
+  "Resolution": "Resolution",
+  "UseResolution": "Change resolution",
+  "FPSValue": "Frames per second",
+  "UseFPS": "Change frames per second"
+}

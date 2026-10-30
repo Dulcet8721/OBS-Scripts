@@ -1,0 +1,15 @@
+{
+  "ScriptDescription": " ",
+  "GroupControl": "Partial replay control",
+  "Enabled": "Enable partial replay",
+  "ResetAfterSave": "Clear buffers after saving",
+  "GroupLengths": "Partial replay length settings",
+  "Clip1": "Partial replay 1 (seconds)",
+  "Clip2": "Partial replay 2 (seconds)",
+  "Clip3": "Partial replay 3 (seconds)",
+  "LengthsInfo": "Values of 0 and >= the main buffer length fully disable the buffer for which an invalid value is set.",
+  "HotkeySave": "Save partial replay %d (%s)",
+  "AutoGroupName": "Auto Buffers (do not assign a hotkey)",
+  "Disabled": "disabled",
+  "SecondsFormat": "%d sec"
+}

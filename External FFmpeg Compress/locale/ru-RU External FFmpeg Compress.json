@@ -1,0 +1,13 @@
+{
+  "ScriptDescription": " ",
+  "GroupCompress": "Сжатие видеофайла",
+  "InputFile": "Выберите видеофайл",
+  "CRFValue": "Степень сжатия (CRF)",
+  "CompressButton": "Сжать видеофайл",
+  "UseHWDecoding": "Использовать аппаратное декодирование",
+  "VideoFilesFilter": "Видеофайлы (*.flv *.mkv *.mp4 *.mov *.ts);;Все файлы (*.*)",
+  "Resolution": "Разрешение",
+  "UseResolution": "Изменять разрешение",
+  "FPSValue": "Частота кадров",
+  "UseFPS": "Изменять частоту кадров"
+}
