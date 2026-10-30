@@ -663,7 +663,7 @@ end
 local function destroy_notification_window()
     destroy_memdc()
     if STATE.popup_hwnd and user32.IsWindow(STATE.popup_hwnd) then
-        user32.PostMessageA(STATE.popup_hwnd, WIN.WM_CLOSE, 0, 0)
+        user32.DestroyWindow(STATE.popup_hwnd)
     end
     STATE.popup_hwnd = nil
 end
@@ -703,15 +703,7 @@ local function advance_queue()
         return
     end
     local ok = pcall(function()
-        if STATE.fonts_need_refresh then
-            refresh_fonts()
-            STATE.fonts_need_refresh = false
-        else
-            prepare_fonts()
-        end
-        if ensure_notification_window() == nil then
-            return
-        end
+        if STATE.popup_hwnd == nil then return end
         local scale = CONFIG.scale / 100.0
         local x, y, w, h = position_xy(scale)
         local topmost = ffi.cast("HWND", ffi.cast("intptr_t", -1))
@@ -936,6 +928,8 @@ function script_load(settings)
     STATE.sound_files = list_sound_files()
     read_settings(settings)
     prepare_fonts()
+    ensure_notification_class()
+    ensure_notification_window()
     STATE.fonts_need_refresh = false
     pcall(function()
         local orphan = user32.FindWindowA(WND_CLASS_NAME, nil)
@@ -951,7 +945,8 @@ end
 function script_update(settings)
     STATE.sound_files = list_sound_files()
     read_settings(settings)
-    STATE.fonts_need_refresh = true
+    refresh_fonts()
+    STATE.fonts_need_refresh = false
 end
 
 function script_save(settings)
