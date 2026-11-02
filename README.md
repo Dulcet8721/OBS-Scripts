@@ -48,7 +48,7 @@
 - Автоматическое создание папок с именами игр.
 - Автоматическая сортировка записей, повторов, скриншотов и частичных повторов по папкам.
 - Автоматическое разделение записи при смене фокуса с игры.
-- Интеграция с [Partial Replay](Partial-Replay) и [Notifier](Notifier)`.
+- Интеграция с [Partial Replay](Partial-Replay) и [Notifier](Notifier).
 
 [Подробное описание Smart File Organizer →](../../wiki/Smart-File-Organizer)
 
