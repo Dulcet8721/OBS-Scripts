@@ -544,9 +544,7 @@ local function paint_popup()
         gdi32.SetBkMode(mdc, WIN.TRANSPARENT)
         gdi32.SetTextColor(mdc, WIN.MAIN_COLOR)
         local title = STATE.heading_text
-        if not title or title == "" then
-            title = " "
-        end
+        if not title or title == "" then title = " " end
         local text_left = stripe + math.floor(9 * s)
         local text_right = w - math.floor(12 * s)
         local title_rect = ffi.new("RECT", {text_left, math.floor(10 * s), text_right, math.floor(46 * s)})
@@ -586,10 +584,7 @@ local function prepare_fonts()
             WIN.CLEARTYPE_QUALITY, WIN.DEFAULT_PITCH, "Segoe UI")
     end
     if STATE.body_font == nil then
-        STATE.body_font = gdi32.CreateFontA(
-            math.floor(BODY_PX * s), 0, 0, 0, 400, 0, 0, 0,
-            WIN.DEFAULT_CHARSET, WIN.OUT_DEFAULT_PRECIS, WIN.CLIP_DEFAULT_PRECIS,
-            WIN.CLEARTYPE_QUALITY, WIN.DEFAULT_PITCH, "Segoe UI")
+        STATE.body_font = gdi32.CreateFontA(math.floor(BODY_PX * s), 0, 0, 0, 400, 0, 0, 0, WIN.DEFAULT_CHARSET, WIN.OUT_DEFAULT_PRECIS, WIN.CLIP_DEFAULT_PRECIS, WIN.CLEARTYPE_QUALITY, WIN.DEFAULT_PITCH, "Segoe UI")
     end
 end
 
@@ -648,12 +643,16 @@ local function ensure_notification_window()
     if STATE.popup_hwnd and user32.IsWindow(STATE.popup_hwnd) then
         return STATE.popup_hwnd
     end
+    if STATE.popup_hwnd then
+        STATE.popup_hwnd = nil
+    end
     ensure_notification_class()
     local scale = CONFIG.scale / 100.0
     local x, y, w, h = position_xy(scale)
     local ex = WIN.WS_EX_TOPMOST + WIN.WS_EX_TOOLWINDOW + WIN.WS_EX_NOACTIVATE + WIN.WS_EX_LAYERED + WIN.WS_EX_TRANSPARENT
     STATE.popup_hwnd = user32.CreateWindowExA(ex, WND_CLASS_NAME, WND_TITLE_NAME, WIN.WS_POPUP, x, y, w, h, nil, nil, STATE.popup_hinstance, nil)
-    if STATE.popup_hwnd == nil or STATE.popup_hwnd == ffi.cast("HWND", 0) then STATE.popup_hwnd = nil
+    if STATE.popup_hwnd == nil or STATE.popup_hwnd == ffi.cast("HWND", 0) then 
+        STATE.popup_hwnd = nil
         return nil
     end
     user32.SetLayeredWindowAttributes(STATE.popup_hwnd, 0, 0, WIN.LWA_ALPHA)
@@ -703,7 +702,7 @@ local function advance_queue()
         return
     end
     local ok = pcall(function()
-        if STATE.popup_hwnd == nil then return end
+        if ensure_notification_window() == nil then return end
         local scale = CONFIG.scale / 100.0
         local x, y, w, h = position_xy(scale)
         local topmost = ffi.cast("HWND", ffi.cast("intptr_t", -1))
@@ -929,14 +928,14 @@ function script_load(settings)
     read_settings(settings)
     prepare_fonts()
     ensure_notification_class()
-    ensure_notification_window()
-    STATE.fonts_need_refresh = false
     pcall(function()
         local orphan = user32.FindWindowA(WND_CLASS_NAME, nil)
         if orphan ~= nil and orphan ~= ffi.cast("HWND", 0) then
-            user32.PostMessageA(orphan, WIN.WM_CLOSE, 0, 0)
+            user32.DestroyWindow(orphan)
         end
     end)
+    ensure_notification_window()
+    STATE.fonts_need_refresh = false
     STATE.event_callback = function(event) pcall(on_frontend_event, event) end
     obs.obs_frontend_add_event_callback(STATE.event_callback)
     obs.timer_add(step_animation, TICK_MS)
