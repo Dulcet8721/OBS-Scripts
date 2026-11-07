@@ -28,6 +28,8 @@ local MOVED_SLOT = 2048
 local MOVED_SLOTS = 128
 local MOVED_TOTAL = MOVED_HEADER + MOVED_SLOT * MOVED_SLOTS
 local MOVED_PAYLOAD_MAX = MOVED_SLOT - 12
+local PR_NOTIFY_NAME = "Local\\OBS_PR_Notify_v1"
+local PENDING_REPLAY_MAX_ATTEMPTS = 10
 local CONFIG = {enabled = true,auto_split = false}
 
 local STATE = {
@@ -65,7 +67,9 @@ local STATE = {
     status_hdr = nil,
     moved_handle = nil,
     moved_view = nil,
-    moved_hdr = nil
+    moved_hdr = nil,
+    pending_replay_path = nil,
+    pending_replay_attempts = 0,
 }
 
 local ffi = require("ffi")
@@ -89,6 +93,7 @@ ffi.cdef[[
     BOOL VerQueryValueW(const void* pBlock, LPCWSTR lpSubBlock, void** lplpBuffer, UINT* puLen);
     HANDLE CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, void* lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
     HANDLE CreateFileMappingW(HANDLE, void*, DWORD, DWORD, DWORD, LPCWSTR);
+    HANDLE OpenFileMappingW(DWORD, BOOL, LPCWSTR);
     void* MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
     BOOL UnmapViewOfFile(void*);
 ]]
@@ -155,6 +160,15 @@ local function bridge_read_one()
     ffi.copy(buf, slot + 4, len)
     bridge_hdr[1] = rs + 1
     return ffi.string(buf, len)
+end
+
+local function pr_is_active()
+    local h = kernel32.OpenFileMappingW(0x0004, 0, bridge_wide(PR_NOTIFY_NAME))
+    if h == nil or h == ffi.cast("HANDLE", 0) then
+        return false
+    end
+    kernel32.CloseHandle(h)
+    return true
 end
 
 local function status_open()
@@ -707,9 +721,9 @@ local function snapshot_context()
         focus = compute_focus_context()
     end
     if focus and focus.matched then
-        return { known = true, matched = true, folder = focus.folder, exe = focus.exe }
+        return {known = true, matched = true, folder = focus.folder, exe = focus.exe}
     end
-    return { known = true, matched = false }
+    return {known = true, matched = false}
 end
 
 local function focus_key(context)
@@ -723,7 +737,7 @@ local function update_focus_if_changed()
         if STATE.focus_hwnd ~= hwnd then
             STATE.focus_hwnd = hwnd
             refresh_window_capture_exes()
-            STATE.focus_context = { matched = false }
+            STATE.focus_context = {matched = false}
         end
         return
     end
@@ -1206,11 +1220,11 @@ local function on_frontend_event(event)
             on_recording_stopped()
         end
     elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED then
-        if CONFIG.enabled then
+        if CONFIG.enabled and not pr_is_active() then
             local path = obs.obs_frontend_get_last_replay()
             if path and path ~= "" then
-                refresh_focus_now()
-                queue_file(path, "replay", snapshot_context())
+                STATE.pending_replay_path = path
+                STATE.pending_replay_attempts = 0
             end
         end
     elseif event == obs.OBS_FRONTEND_EVENT_SCREENSHOT_TAKEN then
@@ -1224,6 +1238,8 @@ local function on_frontend_event(event)
     elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
         STATE.exiting = true
         disconnect_recording()
+        STATE.pending_replay_path = nil
+        STATE.pending_replay_attempts = 0
     end
 end
 
@@ -1275,6 +1291,8 @@ function script_update(settings)
     if not CONFIG.enabled then
         STATE.queue = {}
         STATE.seen = {}
+        STATE.pending_replay_path = nil
+        STATE.pending_replay_attempts = 0
         disconnect_recording()
         STATE.pending_auto_start = false
         STATE.pending_start_segment = nil
@@ -1335,7 +1353,30 @@ function script_tick(seconds)
         if #STATE.queue > 0 then
             STATE.queue = {}
         end
+        STATE.pending_replay_path = nil
+        STATE.pending_replay_attempts = 0
         return
+    end
+    if STATE.pending_replay_path then
+        STATE.pending_replay_attempts = STATE.pending_replay_attempts + 1
+        local path = STATE.pending_replay_path
+        local ok, result = pcall(function()
+            refresh_focus_now()
+            local ctx = snapshot_context()
+            return queue_file(path, "replay", ctx)
+        end)
+        if not ok then
+            if STATE.pending_replay_attempts >= PENDING_REPLAY_MAX_ATTEMPTS then
+                STATE.pending_replay_path = nil
+                STATE.pending_replay_attempts = 0
+            end
+        elseif result then
+            STATE.pending_replay_path = nil
+            STATE.pending_replay_attempts = 0
+        else
+            STATE.pending_replay_path = nil
+            STATE.pending_replay_attempts = 0
+        end
     end
     pcall(update_focus_if_changed)
     local rb_active = obs.obs_frontend_replay_buffer_active and obs.obs_frontend_replay_buffer_active() or false
@@ -1381,6 +1422,8 @@ function script_unload()
     moved_close()
     STATE.queue = {}
     STATE.seen = {}
+    STATE.pending_replay_path = nil
+    STATE.pending_replay_attempts = 0
     STATE.focus_hwnd = nil
     STATE.focus_context = nil
     STATE.active_context = nil

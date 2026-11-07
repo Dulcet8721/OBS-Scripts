@@ -2,7 +2,13 @@ local obs = obslua
 local MAX_AUDIO_MIXES = 6
 local UI_MAX_SECONDS = 3600
 local DEFAULT_DURATIONS = { 30, 60, 120 }
-local BUFFER_IDS = { 1, 2, 3 }
+local BUFFER_IDS = {1, 2, 3}
+local LOCALE_NAME = "Partial Replay"
+local SYNC_TOLERANCE_MS = 100
+local SAFETY_TIMEOUT_MS = 30000
+local START_RETRY_AFTER_MS = 3000
+local START_MAX_ATTEMPTS = 2
+local FILE_STABLE_TICKS = 5
 local default_loc = nil
 local current_loc = nil
 local enabled = false
@@ -13,21 +19,33 @@ local outputs = {}
 local output_signals = {}
 local pending_saves = {}
 local pending_restarts = {}
-local main_reset_pending = false
-local main_stopped_by_reset = false
-local pending_main_restart = false
-local last_main_restart_try = 0
 local event_callback = nil
-local exit_in_progress = false
 local signals_available = false
 local start_output_by_id = nil
-local handle_saved = nil
+local handle_saved_finalized = nil
 local begin_main_reset = nil
 local reset_buffer_ids = nil
+local get_main_limit = nil
 local hotkey_ids = {}
-local LOCALE_NAME = "Partial Replay"
 local shared_memory_queue = {}
 local shared_memory_queue_max = 1000
+local finalize_queue = {}
+local buffer_start_time = {}
+local main_buffer_start_time = nil
+local T_save_request = {}
+local child_deactivated = {}
+local child_saved_queue = {}
+local main_output_ref = nil
+local main_signals = nil
+local main_stop_seen = false
+local main_deactivate_seen = false
+local main_start_seen = false
+local main_activate_seen = false
+local reset_state = "idle"
+local state_entered_at = 0
+local last_status_log = 0
+local start_attempts = 0
+local last_start_attempt_at = 0
 local ffi = require("ffi")
 local BRIDGE_NAME = "Local\\OBS_SFO_Bridge_v1"
 local BRIDGE_HEADER = 8
@@ -54,18 +72,12 @@ ffi.cdef[[
 ]]
 
 local kernel32 = ffi.load("kernel32")
-local bridge_handle = nil
-local bridge_view = nil
-local bridge_hdr = nil
-local notify_handle = nil
-local notify_view = nil
-local notify_hdr = nil
+local bridge_handle, bridge_view, bridge_hdr = nil, nil, nil
+local notify_handle, notify_view, notify_hdr = nil, nil, nil
 
 local function bridge_wide(s)
     local b = ffi.new("unsigned short[?]", #s + 1)
-    for i = 1, #s do
-        b[i-1] = s:byte(i)
-    end
+    for i = 1, #s do b[i-1] = s:byte(i) end
     b[#s] = 0
     return b
 end
@@ -76,23 +88,15 @@ local function bridge_open()
     if bridge_handle == nil or bridge_handle == ffi.cast("HANDLE", 0) then return false end
     bridge_view = kernel32.MapViewOfFile(bridge_handle, 0x000F001F, 0, 0, BRIDGE_TOTAL)
     if bridge_view == nil then
-        kernel32.CloseHandle(bridge_handle)
-        bridge_handle = nil
-        return false
+        kernel32.CloseHandle(bridge_handle); bridge_handle = nil; return false
     end
     bridge_hdr = ffi.cast("unsigned int*", bridge_view)
     return true
 end
 
 local function bridge_close()
-    if bridge_view then
-        kernel32.UnmapViewOfFile(bridge_view)
-        bridge_view = nil
-    end
-    if bridge_handle then
-        kernel32.CloseHandle(bridge_handle)
-        bridge_handle = nil
-    end
+    if bridge_view then kernel32.UnmapViewOfFile(bridge_view); bridge_view = nil end
+    if bridge_handle then kernel32.CloseHandle(bridge_handle); bridge_handle = nil end
     bridge_hdr = nil
 end
 
@@ -114,28 +118,19 @@ local function notify_open()
     if notify_view then return true end
     notify_handle = kernel32.CreateFileMappingW(ffi.cast("HANDLE", -1), nil, 0x04, 0, NOTIFY_TOTAL, bridge_wide(NOTIFY_NAME))
     if notify_handle == nil or notify_handle == ffi.cast("HANDLE", 0) then
-        notify_handle = nil
-        return false
+        notify_handle = nil; return false
     end
     notify_view = kernel32.MapViewOfFile(notify_handle, 0x000F001F, 0, 0, NOTIFY_TOTAL)
     if notify_view == nil then
-        kernel32.CloseHandle(notify_handle)
-        notify_handle = nil
-        return false
+        kernel32.CloseHandle(notify_handle); notify_handle = nil; return false
     end
     notify_hdr = ffi.cast("unsigned int*", notify_view)
     return true
 end
 
 local function notify_close()
-    if notify_view then
-        kernel32.UnmapViewOfFile(notify_view)
-        notify_view = nil
-    end
-    if notify_handle then
-        kernel32.CloseHandle(notify_handle)
-        notify_handle = nil
-    end
+    if notify_view then kernel32.UnmapViewOfFile(notify_view); notify_view = nil end
+    if notify_handle then kernel32.CloseHandle(notify_handle); notify_handle = nil end
     notify_hdr = nil
 end
 
@@ -156,47 +151,23 @@ end
 
 local function now_ms()
     if obs.os_gettime_ns then
-        local value = tonumber(obs.os_gettime_ns())
-        if value then
-            return value / 1000000
-        end
+        local v = tonumber(obs.os_gettime_ns())
+        if v then return v / 1000000 end
     end
     return os.time() * 1000
 end
 
-local function init_locale()
-    if default_loc then return end
-    local dir = script_path():match("(.*[/\\])") or ""
-    local loc_dir = dir .. "locale/"
-    local lang = "en-US"
-    if obs.obs_get_locale then
-        lang = obs.obs_get_locale() or lang
-    end
-    default_loc = obs.obs_data_create_from_json_file(loc_dir .. "en-US " .. LOCALE_NAME .. ".json")
-    current_loc = obs.obs_data_create_from_json_file(loc_dir .. lang .. " " .. LOCALE_NAME .. ".json")
-        or obs.obs_data_create_from_json_file(loc_dir .. tostring(lang):sub(1, 2) .. " " .. LOCALE_NAME .. ".json")
+local function get_file_size(path)
+    if not path or path == "" then return nil end
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local size = f:seek("end")
+    f:close()
+    return size
 end
 
-local function getString(key)
-    local value = current_loc and obs.obs_data_get_string(current_loc, key) or ""
-    if value == "" and default_loc then
-        value = obs.obs_data_get_string(default_loc, key)
-    end
-    return value ~= "" and value or key
-end
-
-local function tr(key, ...)
-    init_locale()
-    local value = getString(key)
-    if select("#", ...) > 0 then
-        return string.format(value, ...)
-    end
-    return value
-end
-
-local function report_child_save(id)
-    local output = outputs[id]
-    if not output then return end
+local function get_last_replay_path(output)
+    if not output then return nil end
     local ok, path = pcall(function()
         local ph = obs.obs_output_get_proc_handler(output)
         if not ph then return nil end
@@ -207,90 +178,201 @@ local function report_child_save(id)
         obs.calldata_destroy(cd)
         return value
     end)
-    if ok and path and path ~= "" then
-        shared_memory_queue[#shared_memory_queue + 1] = {path = path, duration = durations[id] or 0}
+    return ok and path or nil
+end
+
+local function init_locale()
+    if default_loc then return end
+    local dir = script_path():match("(.*[/\\])") or ""
+    local loc_dir = dir .. "locale/"
+    local lang = "en-US"
+    if obs.obs_get_locale then lang = obs.obs_get_locale() or lang end
+    default_loc = obs.obs_data_create_from_json_file(loc_dir .. "en-US " .. LOCALE_NAME .. ".json")
+    current_loc = obs.obs_data_create_from_json_file(loc_dir .. lang .. " " .. LOCALE_NAME .. ".json")
+        or obs.obs_data_create_from_json_file(loc_dir .. tostring(lang):sub(1, 2) .. " " .. LOCALE_NAME .. ".json")
+end
+
+local function getString(key)
+    local value = current_loc and obs.obs_data_get_string(current_loc, key) or ""
+    if value == "" and default_loc then value = obs.obs_data_get_string(default_loc, key) end
+    return value ~= "" and value or key
+end
+
+local function tr(key, ...)
+    init_locale()
+    local value = getString(key)
+    if select("#", ...) > 0 then return string.format(value, ...) end
+    return value
+end
+
+local function get_main_output() return obs.obs_frontend_get_replay_buffer_output() end
+local function frontend_active()
+    return obs.obs_frontend_replay_buffer_active and obs.obs_frontend_replay_buffer_active() or false
+end
+local function main_is_active() return frontend_active() end
+
+local function child_is_active(id)
+    local o = outputs[id]
+    if not o then return false end
+    local ok, a = pcall(obs.obs_output_active, o)
+    return ok and a == true
+end
+
+local function all_children_deactivated()
+    for _, id in ipairs(BUFFER_IDS) do
+        if not child_deactivated[id] then return false end
+    end
+    return true
+end
+
+local function unsubscribe_main()
+    if not main_signals then return end
+    local h = main_signals.handler
+    if obs.signal_handler_disconnect and h then
+        pcall(obs.signal_handler_disconnect, h, "stop", main_signals.stop_cb)
+        pcall(obs.signal_handler_disconnect, h, "start", main_signals.start_cb)
+        pcall(obs.signal_handler_disconnect, h, "activate", main_signals.activate_cb)
+        pcall(obs.signal_handler_disconnect, h, "deactivate", main_signals.deactivate_cb)
+    end
+    main_signals = nil
+    if main_output_ref then obs.obs_output_release(main_output_ref); main_output_ref = nil end
+end
+
+local function subscribe_main()
+    unsubscribe_main()
+    local m = get_main_output()
+    if not m then return false end
+    local handler = obs.obs_output_get_signal_handler(m)
+    if not handler then obs.obs_output_release(m); return false end
+    local stop_cb = function() main_stop_seen = true end
+    local start_cb = function() main_start_seen = true end
+    local activate_cb = function() main_activate_seen = true end
+    local deactivate_cb = function() main_deactivate_seen = true end
+    obs.signal_handler_connect(handler, "stop", stop_cb)
+    obs.signal_handler_connect(handler, "start", start_cb)
+    obs.signal_handler_connect(handler, "activate", activate_cb)
+    obs.signal_handler_connect(handler, "deactivate", deactivate_cb)
+    main_output_ref = m
+    main_signals = {handler=handler, stop_cb=stop_cb, start_cb=start_cb, activate_cb=activate_cb, deactivate_cb=deactivate_cb}
+    return true
+end
+
+local function reset_flags_before_stop()
+    main_stop_seen = false; main_deactivate_seen = false
+    main_start_seen = false; main_activate_seen = false
+end
+
+local function reset_flags_before_start()
+    main_start_seen = false; main_activate_seen = false
+end
+
+local function set_reset_state(s, reason)
+    if reset_state == s then return end
+    reset_state = s
+    state_entered_at = now_ms()
+    last_status_log = 0
+end
+
+local function try_call_start(now)
+    reset_flags_before_start()
+    start_attempts = start_attempts + 1
+    last_start_attempt_at = now
+    obs.obs_frontend_replay_buffer_start()
+end
+
+local function enqueue_finalize(id, path, duration, T_save)
+    finalize_queue[#finalize_queue + 1] = {id = id, path = path, duration = duration or 0, T_save = T_save, last_size = -1, stable_ticks = 0}
+end
+
+local function push_shared_memory(path, duration)
+    if path and path ~= "" then
+        shared_memory_queue[#shared_memory_queue + 1] = {path = path, duration = duration or 0}
         if #shared_memory_queue > shared_memory_queue_max then
             table.remove(shared_memory_queue, 1)
         end
     end
 end
 
-local function get_main_output()
-    return obs.obs_frontend_get_replay_buffer_output()
+local function finalize_and_handle(entry)
+    if entry.id ~= "main" then
+        pending_saves[entry.id] = nil
+    end
+    local notify_duration = (entry.id == "main") and 0 or (entry.duration or 0)
+    push_shared_memory(entry.path, notify_duration)
+    handle_saved_finalized(entry.id, entry.T_save, entry.duration, entry.path)
 end
 
-local function get_main_limit()
-    local active = false
-    if obs.obs_frontend_replay_buffer_active then
-        active = obs.obs_frontend_replay_buffer_active()
-    end
-    local output_limit, output_known = nil, false
-    local main = get_main_output()
-    if main then
-        local settings = obs.obs_output_get_settings(main)
-        if settings then
-            output_known = true
-            local limit = obs.obs_data_get_int(settings, "max_time_sec")
-            if limit and limit > 0 then output_limit = limit end
-            obs.obs_data_release(settings)
-        end
-        obs.obs_output_release(main)
-    end
-    if active and output_known then return output_limit end
-    if obs.obs_frontend_get_profile_config and obs.config_get_int then
-        local config = obs.obs_frontend_get_profile_config()
-        if config then
-            local mode = ""
-            if obs.config_get_string then
-                mode = obs.config_get_string(config, "Output", "Mode") or ""
+local function tick_finalize_queue()
+    if #finalize_queue == 0 then return end
+    local remaining = {}
+    for _, entry in ipairs(finalize_queue) do
+        local size = get_file_size(entry.path)
+        if size == nil then
+            remaining[#remaining + 1] = entry
+        else
+            if size == entry.last_size then
+                entry.stable_ticks = entry.stable_ticks + 1
+            else
+                entry.last_size = size
+                entry.stable_ticks = 0
             end
-            local sections = {}
-            if tostring(mode):lower() == "advanced" then
-                table.insert(sections, "AdvOut")
-            end
-            table.insert(sections, "SimpleOutput")
-            table.insert(sections, "AdvOut")
-            for _, section in ipairs(sections) do
-                local seconds = obs.config_get_int(config, section, "RecRBTime")
-                if seconds and seconds > 0 then return seconds end
+            if entry.stable_ticks >= FILE_STABLE_TICKS then
+                finalize_and_handle(entry)
+            else
+                remaining[#remaining + 1] = entry
             end
         end
     end
-    return output_limit
+    finalize_queue = remaining
 end
 
-local function get_duration(id)
-    return durations[id] or 0
+local function on_output_saved(id)
+    child_saved_queue[#child_saved_queue + 1] = id
 end
 
-local function buffer_label(id)
-    return tr("AutoGroupName")
-end
-
-local function hotkey_label(id)
-    local duration = get_duration(id)
-    local status = ""
-    if duration <= 0 or (main_limit and main_limit > 0 and duration >= main_limit) then
-        status = tr("Disabled")
-    else
-        status = tr("SecondsFormat", duration)
+local function connect_output_signals(id, output)
+    if not signals_available or output_signals[id] then return end
+    local handler = obs.obs_output_get_signal_handler(output)
+    if not handler then return end
+    local saved_cb = function() on_output_saved(id) end
+    local stop_cb = function() end
+    local deactivate_cb = function()
+        child_deactivated[id] = true
     end
-    return tr("HotkeySave", id, status)
+    obs.signal_handler_connect(handler, "saved", saved_cb)
+    obs.signal_handler_connect(handler, "stop", stop_cb)
+    obs.signal_handler_connect(handler, "deactivate", deactivate_cb)
+    output_signals[id] = {handler=handler, saved=saved_cb, stop=stop_cb, deactivate=deactivate_cb}
 end
 
-local function get_output(id)
-    return outputs[id]
+local function disconnect_output_signals(id)
+    local info = output_signals[id]
+    if not info then return end
+    if obs.signal_handler_disconnect then
+        obs.signal_handler_disconnect(info.handler, "saved", info.saved)
+        if info.stop then obs.signal_handler_disconnect(info.handler, "stop", info.stop) end
+        if info.deactivate then obs.signal_handler_disconnect(info.handler, "deactivate", info.deactivate) end
+    end
+    output_signals[id] = nil
 end
 
-local function frontend_active()
-    return obs.obs_frontend_replay_buffer_active and obs.obs_frontend_replay_buffer_active() or false
+local function get_duration(id) return durations[id] or 0 end
+local function buffer_label(id) return tr("AutoGroupName") end
+local function get_output(id) return outputs[id] end
+
+local function should_start(id, limit)
+    if not enabled then return false end
+    local d = durations[id] or 0
+    if d <= 0 then return false end
+    if limit and limit > 0 and d >= limit then return false end
+    return true
 end
 
-local function normalize_duration(value)
-    value = tonumber(value) or 0
-    value = math.floor(value + 0.5)
-    if value < 0 then value = 0 end
-    return value
+local function normalize_duration(v)
+    v = tonumber(v) or 0
+    v = math.floor(v + 0.5)
+    if v < 0 then v = 0 end
+    return v
 end
 
 local function read_settings(settings)
@@ -322,45 +404,11 @@ local function build_output_settings(main_settings, id)
     return settings
 end
 
-local function should_start(id, limit)
-    if not enabled then return false end
-    local duration = durations[id] or 0
-    if duration <= 0 then return false end
-    if limit and limit > 0 and duration >= limit then return false end
-    return true
-end
-
-local function on_output_saved(id)
-    pending_saves[id] = nil
-    report_child_save(id)
-    handle_saved(id)
-end
-
-local function connect_output_signals(id, output)
-    if not signals_available or output_signals[id] then return end
-    local handler = obs.obs_output_get_signal_handler(output)
-    if not handler then return end
-    local saved_cb = function()
-        on_output_saved(id)
-    end
-    obs.signal_handler_connect(handler, "saved", saved_cb)
-    output_signals[id] = { handler = handler, saved = saved_cb }
-end
-
-local function disconnect_output_signals(id)
-    local info = output_signals[id]
-    if not info then return end
-    if obs.signal_handler_disconnect then
-        obs.signal_handler_disconnect(info.handler, "saved", info.saved)
-    end
-    output_signals[id] = nil
-end
-
 local function apply_main_limit(limit)
     main_limit = limit
     for slot = 1, 3 do
         if hotkey_ids[slot] then
-            obs.obs_hotkey_set_description(hotkey_ids[slot], hotkey_label(slot))
+            obs.obs_hotkey_set_description(hotkey_ids[slot], tr("HotkeySave", slot, (durations[slot] > 0 and (not limit or durations[slot] < limit)) and tr("SecondsFormat", durations[slot]) or tr("Disabled")))
         end
     end
 end
@@ -371,6 +419,7 @@ local function start_single_output(id, ctx, force_restart)
         pending_saves[id] = nil
         pending_restarts[id] = nil
         if output and obs.obs_output_active(output) then
+            buffer_start_time[id] = nil
             obs.obs_output_force_stop(output)
         end
         return true
@@ -388,17 +437,18 @@ local function start_single_output(id, ctx, force_restart)
     connect_output_signals(id, output)
     if obs.obs_output_active(output) and force_restart then
         pending_restarts[id] = true
-        return true
+        buffer_start_time[id] = nil
+        obs.obs_output_force_stop(output)
+        return false
     end
     if obs.obs_output_active(output) and not force_restart then
         local active_settings = obs.obs_output_get_settings(output)
         local active_duration = active_settings and obs.obs_data_get_int(active_settings, "max_time_sec") or 0
-        if active_settings then
-            obs.obs_data_release(active_settings)
-        end
+        if active_settings then obs.obs_data_release(active_settings) end
         if active_duration ~= get_duration(id) then
             pending_saves[id] = nil
             pending_restarts[id] = true
+            buffer_start_time[id] = nil
             obs.obs_output_force_stop(output)
             return true
         end
@@ -417,21 +467,22 @@ local function start_single_output(id, ctx, force_restart)
     end
     if obs.obs_output_start(output) then
         pending_restarts[id] = nil
+        buffer_start_time[id] = now_ms()
+        child_deactivated[id] = false
         return true
     end
     pending_restarts[id] = true
+    buffer_start_time[id] = nil
     return false
 end
 
-local function start_outputs()
+local function start_outputs(force_restart)
+    if force_restart == nil then force_restart = false end
     if not enabled or not frontend_active() then return false end
     local main = get_main_output()
     if not main then return false end
     local main_settings = obs.obs_output_get_settings(main)
-    if not main_settings then
-        obs.obs_output_release(main)
-        return false
-    end
+    if not main_settings then obs.obs_output_release(main); return false end
     local main_video = obs.obs_output_get_video_encoder(main)
     if not main_video then
         obs.obs_data_release(main_settings)
@@ -445,10 +496,8 @@ local function start_outputs()
     local limit = obs.obs_data_get_int(main_settings, "max_time_sec") or 0
     if limit <= 0 then limit = nil end
     apply_main_limit(limit)
-    local ctx = { main_settings = main_settings, main_video = main_video, main_audio = main_audio, limit = limit }
-    for _, id in ipairs(BUFFER_IDS) do
-        start_single_output(id, ctx)
-    end
+    local ctx = {main_settings=main_settings, main_video=main_video, main_audio=main_audio, limit=limit}
+    for _, id in ipairs(BUFFER_IDS) do start_single_output(id, ctx, force_restart) end
     obs.obs_data_release(main_settings)
     obs.obs_output_release(main)
     return true
@@ -459,10 +508,7 @@ start_output_by_id = function(id, force_restart)
     local main = get_main_output()
     if not main then return false end
     local main_settings = obs.obs_output_get_settings(main)
-    if not main_settings then
-        obs.obs_output_release(main)
-        return false
-    end
+    if not main_settings then obs.obs_output_release(main); return false end
     local main_video = obs.obs_output_get_video_encoder(main)
     if not main_video then
         obs.obs_data_release(main_settings)
@@ -476,90 +522,229 @@ start_output_by_id = function(id, force_restart)
     local limit = obs.obs_data_get_int(main_settings, "max_time_sec") or 0
     if limit <= 0 then limit = nil end
     apply_main_limit(limit)
-    local ctx = { main_settings = main_settings, main_video = main_video, main_audio = main_audio, limit = limit }
+    local ctx = {main_settings=main_settings, main_video=main_video, main_audio=main_audio, limit=limit}
     local result = start_single_output(id, ctx, force_restart)
     obs.obs_data_release(main_settings)
     obs.obs_output_release(main)
     return result
 end
 
+get_main_limit = function()
+    local active = frontend_active()
+    local output_limit, output_known = nil, false
+    local main = get_main_output()
+    if main then
+        local settings = obs.obs_output_get_settings(main)
+        if settings then
+            output_known = true
+            local limit = obs.obs_data_get_int(settings, "max_time_sec")
+            if limit and limit > 0 then output_limit = limit end
+            obs.obs_data_release(settings)
+        end
+        obs.obs_output_release(main)
+    end
+    if active and output_known then return output_limit end
+    if obs.obs_frontend_get_profile_config and obs.config_get_int then
+        local config = obs.obs_frontend_get_profile_config()
+        if config then
+            local mode = ""
+            if obs.config_get_string then
+                mode = obs.config_get_string(config, "Output", "Mode") or ""
+            end
+            local sections = {}
+            if tostring(mode):lower() == "advanced" then table.insert(sections, "AdvOut") end
+            table.insert(sections, "SimpleOutput")
+            table.insert(sections, "AdvOut")
+            for _, section in ipairs(sections) do
+                local sec = obs.config_get_int(config, section, "RecRBTime")
+                if sec and sec > 0 then return sec end
+            end
+        end
+    end
+    return output_limit
+end
+
+begin_main_reset = function()
+    if not reset_enabled then return end
+    if reset_state ~= "idle" then return end
+    subscribe_main()
+    reset_flags_before_stop()
+    start_attempts = 0
+    child_deactivated = {}
+    for _, id in ipairs(BUFFER_IDS) do
+        local o = outputs[id]
+        if o and obs.obs_output_active(o) then
+            pending_restarts[id] = true
+            buffer_start_time[id] = nil
+            child_deactivated[id] = false
+            obs.obs_output_force_stop(o)
+        else
+            child_deactivated[id] = true
+            buffer_start_time[id] = nil
+        end
+    end
+    set_reset_state("stopping_children", "begin_main_reset")
+end
+
 reset_buffer_ids = function(ids)
+    if reset_state ~= "idle" then return end
     for _, id in ipairs(ids) do
         local output = get_output(id)
         if output and obs.obs_output_active(output) and not pending_saves[id] then
             pending_restarts[id] = true
+            buffer_start_time[id] = nil
             obs.obs_output_force_stop(output)
         end
     end
 end
 
-begin_main_reset = function()
-    if not enabled or not reset_enabled or main_reset_pending then return end
-    main_reset_pending = true
-    main_stopped_by_reset = true
-    pending_saves = {}
-    pending_restarts = {}
-    obs.obs_frontend_replay_buffer_stop()
-end
-
-handle_saved = function(id)
+handle_saved_finalized = function(id, T_save, saved_nominal, path)
     if not reset_enabled then return end
     if id == "main" then
         begin_main_reset()
         return
     end
-    local saved_duration = get_duration(id)
+    if not saved_nominal or saved_nominal <= 0 then
+        local saved_duration = get_duration(id)
+        local ids = {}
+        for slot = 1, 3 do
+            local dur = durations[slot] or 0
+            if dur > 0 and dur <= saved_duration then table.insert(ids, slot) end
+        end
+        reset_buffer_ids(ids)
+        return
+    end
+    local saved_buf_start = buffer_start_time[id] or (T_save - saved_nominal * 1000)
+    local saved_actual_ms = math.min(saved_nominal * 1000, T_save - saved_buf_start)
+    if saved_actual_ms < 0 then saved_actual_ms = 0 end
+    local saved_start = T_save - saved_actual_ms
     local ids = {}
     for slot = 1, 3 do
-        local duration = durations[slot] or 0
-        if duration > 0 and duration <= saved_duration then
-            table.insert(ids, slot)
+        local dur = durations[slot] or 0
+        if dur > 0 then
+            local bs = buffer_start_time[slot] or (T_save - dur * 1000)
+            local actual_start = math.max(bs, T_save - dur * 1000)
+            local covered = actual_start >= (saved_start - SYNC_TOLERANCE_MS)
+            if covered then table.insert(ids, slot) end
         end
     end
-    reset_buffer_ids(ids)
+    local should_reset_main = false
+    if main_buffer_start_time and main_limit and main_limit > 0 then
+        local main_actual_start = math.max(main_buffer_start_time, T_save - main_limit * 1000)
+        should_reset_main = main_actual_start >= (saved_start - SYNC_TOLERANCE_MS)
+    end
+    if should_reset_main then
+        begin_main_reset()
+    else
+        reset_buffer_ids(ids)
+    end
 end
 
 local function force_stop_outputs(ids)
     ids = ids or BUFFER_IDS
     pending_saves = {}
     pending_restarts = {}
-    pending_main_restart = false
+    finalize_queue = {}
     for _, id in ipairs(ids) do
         local output = get_output(id)
         if output and obs.obs_output_active(output) then
+            buffer_start_time[id] = nil
             obs.obs_output_force_stop(output)
         end
     end
 end
 
-local function on_frontend_event(event)
-    if event == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING then
-        if enabled and frontend_active() then start_outputs() end
-    elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED then
-        main_reset_pending = false
-        main_stopped_by_reset = false
-        pending_main_restart = false
-        last_main_restart_try = 0
-        if enabled then start_outputs() end
-    elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED then
-        force_stop_outputs()
-        if main_reset_pending then
-            pending_main_restart = true
-            last_main_restart_try = 0
+local function tick_state_machine()
+    local now = now_ms()
+    if reset_state == "stopping_children" then
+        if all_children_deactivated() then
+            main_stop_seen = false
+            main_deactivate_seen = false
+            set_reset_state("waiting_main_stop", "children DEACTIVATE")
+            obs.obs_frontend_replay_buffer_stop()
+        elseif now - state_entered_at > SAFETY_TIMEOUT_MS then
+            set_reset_state("idle", "children timeout")
         end
-    elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED then
-        if not enabled then return end
-        handle_saved("main")
-    elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
-        exit_in_progress = true
-        force_stop_outputs()
+        return
+    end
+    if reset_state == "waiting_main_stop" then
+        if main_deactivate_seen and not main_is_active() then
+            set_reset_state("waiting_main_start", "main fully stopped")
+            start_attempts = 0
+            try_call_start(now)
+        elseif now - state_entered_at > SAFETY_TIMEOUT_MS then
+            set_reset_state("idle", "main stop timeout")
+        end
+        return
+    end
+    if reset_state == "waiting_main_start" then
+        if main_start_seen or main_activate_seen or main_is_active() then
+            set_reset_state("starting_children", "main started")
+            main_buffer_start_time = now_ms()
+            for _, id in ipairs(BUFFER_IDS) do
+                if should_start(id, main_limit) and not child_is_active(id) then
+                    pending_restarts[id] = true
+                end
+            end
+        elseif now - last_start_attempt_at >= START_RETRY_AFTER_MS
+               and start_attempts < START_MAX_ATTEMPTS then
+            try_call_start(now)
+        elseif now - state_entered_at > SAFETY_TIMEOUT_MS then
+            set_reset_state("idle", "main start timeout")
+        end
+        return
+    end
+    if reset_state == "starting_children" then
+        local all_ok = true
+        for _, id in ipairs(BUFFER_IDS) do
+            if should_start(id, main_limit) and not child_is_active(id) then
+                all_ok = false
+                break
+            end
+        end
+        if all_ok then
+            set_reset_state("idle", "reset complete")
+        elseif now - state_entered_at > SAFETY_TIMEOUT_MS then
+            set_reset_state("idle", "children timeout")
+        end
+        return
     end
 end
 
-local function add_length_properties(group)
-    obs.obs_properties_add_int(group, "clip1_seconds", tr("Clip1"), 0, UI_MAX_SECONDS, 1)
-    obs.obs_properties_add_int(group, "clip2_seconds", tr("Clip2"), 0, UI_MAX_SECONDS, 1)
-    obs.obs_properties_add_int(group, "clip3_seconds", tr("Clip3"), 0, UI_MAX_SECONDS, 1)
+local function on_frontend_event(event)
+    if event == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING then
+        if enabled and frontend_active() then
+            for _, id in ipairs(BUFFER_IDS) do
+                if should_start(id, main_limit) and not child_is_active(id) then
+                    pending_restarts[id] = true
+                end
+            end
+        end
+    elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED then
+        main_buffer_start_time = now_ms()
+    elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED then
+        T_save_request = {}
+    elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED then
+        local main_output = get_main_output()
+        local path = nil
+        if main_output then
+            path = get_last_replay_path(main_output)
+            obs.obs_output_release(main_output)
+        end
+        local duration = main_limit or get_main_limit() or 0
+        local T_save = now_ms()
+        if path and path ~= "" then
+            enqueue_finalize("main", path, duration, T_save)
+        else
+            handle_saved_finalized("main", T_save, duration, nil)
+        end
+    elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
+        set_reset_state("idle", "exit")
+        unsubscribe_main()
+        force_stop_outputs()
+        T_save_request = {}
+        main_buffer_start_time = nil
+    end
 end
 
 function script_description()
@@ -584,7 +769,9 @@ function script_properties()
     obs.obs_properties_add_bool(control, "reset_after_save", tr("ResetAfterSave"))
     obs.obs_properties_add_group(props, "group_control", tr("GroupControl"), obs.OBS_GROUP_NORMAL, control)
     local lengths = obs.obs_properties_create()
-    add_length_properties(lengths)
+    obs.obs_properties_add_int(lengths, "clip1_seconds", tr("Clip1"), 0, UI_MAX_SECONDS, 1)
+    obs.obs_properties_add_int(lengths, "clip2_seconds", tr("Clip2"), 0, UI_MAX_SECONDS, 1)
+    obs.obs_properties_add_int(lengths, "clip3_seconds", tr("Clip3"), 0, UI_MAX_SECONDS, 1)
     obs.obs_properties_add_text(lengths, "lengths_info", tr("LengthsInfo"), obs.OBS_TEXT_INFO)
     obs.obs_properties_add_group(props, "group_lengths", tr("GroupLengths"), obs.OBS_GROUP_NORMAL, lengths)
     return props
@@ -599,11 +786,15 @@ function script_load(settings)
     event_callback = on_frontend_event
     obs.obs_frontend_add_event_callback(event_callback)
     for slot = 1, 3 do
-        local hotkey_key = "partial_replay_hotkey_" .. slot
-        local callback = function(pressed)
+        local key = "partial_replay_hotkey_" .. slot
+        local cb = function(pressed)
             if pressed and enabled then
+                if reset_state ~= "idle" then return end
                 local output = outputs[slot]
                 if output and obs.obs_output_active(output) then
+                    T_save_request[slot] = now_ms()
+                    T_save_request["duration_" .. slot] = get_duration(slot)
+                    pending_saves[slot] = true
                     local ph = obs.obs_output_get_proc_handler(output)
                     if ph then
                         local cd = obs.calldata_create()
@@ -613,11 +804,13 @@ function script_load(settings)
                 end
             end
         end
-        hotkey_ids[slot] = obs.obs_hotkey_register_frontend(hotkey_key, hotkey_label(slot), callback)
-        local saved_array = obs.obs_data_get_array(settings, hotkey_key)
-        obs.obs_hotkey_load(hotkey_ids[slot], saved_array)
-        obs.obs_data_array_release(saved_array)
+        hotkey_ids[slot] = obs.obs_hotkey_register_frontend(key,
+            tr("HotkeySave", slot, tr("SecondsFormat", durations[slot])), cb)
+        local saved_arr = obs.obs_data_get_array(settings, key)
+        obs.obs_hotkey_load(hotkey_ids[slot], saved_arr)
+        obs.obs_data_array_release(saved_arr)
     end
+
     if enabled and frontend_active() then start_outputs() end
 end
 
@@ -626,29 +819,18 @@ function script_update(settings)
     read_settings(settings)
     for slot = 1, 3 do
         if hotkey_ids[slot] then
-            obs.obs_hotkey_set_description(hotkey_ids[slot], hotkey_label(slot))
+            obs.obs_hotkey_set_description(hotkey_ids[slot], tr("HotkeySave", slot, (durations[slot] > 0 and (not main_limit or durations[slot] < main_limit)) and tr("SecondsFormat", durations[slot]) or tr("Disabled")))
         end
     end
     if not enabled then
-        pending_main_restart = false
-        last_main_restart_try = 0
-        if main_reset_pending and not frontend_active() and not exit_in_progress then
-            obs.obs_frontend_replay_buffer_start()
-        end
-        main_reset_pending = false
-        main_stopped_by_reset = false
         force_stop_outputs()
         return
     end
     if not frontend_active() then
         force_stop_outputs()
-        if main_reset_pending then
-            pending_main_restart = true
-            last_main_restart_try = 0
-        end
         return
     end
-    if main_reset_pending then return end
+    if reset_state ~= "idle" then return end
     start_outputs()
 end
 
@@ -658,10 +840,10 @@ function script_save(settings)
     obs.obs_data_set_bool(settings, "reset_after_save", reset_enabled)
     for slot = 1, 3 do
         obs.obs_data_set_int(settings, "clip" .. slot .. "_seconds", durations[slot])
-        local hotkey_key = "partial_replay_hotkey_" .. slot
-        local hotkey_array = obs.obs_hotkey_save(hotkey_ids[slot])
-        obs.obs_data_set_array(settings, hotkey_key, hotkey_array)
-        obs.obs_data_array_release(hotkey_array)
+        local key = "partial_replay_hotkey_" .. slot
+        local arr = obs.obs_hotkey_save(hotkey_ids[slot])
+        obs.obs_data_set_array(settings, key, arr)
+        obs.obs_data_array_release(arr)
     end
 end
 
@@ -676,38 +858,45 @@ function script_tick(seconds)
             if notify_view then notify_write(item.path, item.duration) end
         end
     end
-    if pending_main_restart then
-        if exit_in_progress then
-            pending_main_restart = false
-        elseif frontend_active() then
-            pending_main_restart = false
-            last_main_restart_try = 0
-        else
-            local now_t = now_ms()
-            if now_t - last_main_restart_try >= 500 then
-                last_main_restart_try = now_t
-                obs.obs_frontend_replay_buffer_start()
+    if #child_saved_queue > 0 then
+        local batch = child_saved_queue
+        child_saved_queue = {}
+        for _, id in ipairs(batch) do
+            local T_save = T_save_request[id] or now_ms()
+            local duration = T_save_request["duration_" .. id] or get_duration(id)
+            T_save_request[id] = nil
+            T_save_request["duration_" .. id] = nil
+            local output = outputs[id]
+            if not output then
+                pending_saves[id] = nil
+            else
+                local path = get_last_replay_path(output)
+                if path and path ~= "" then
+                    enqueue_finalize(id, path, duration, T_save)
+                else
+                    pending_saves[id] = nil
+                    handle_saved_finalized(id, T_save, duration, nil)
+                end
             end
         end
     end
+    tick_finalize_queue()
+    tick_state_machine()
+    if reset_state ~= "idle" and reset_state ~= "starting_children" then return end
     if not next(pending_restarts) then return end
     if not enabled or not frontend_active() then
         pending_restarts = {}
         return
     end
     local to_check = {}
-    for id in pairs(pending_restarts) do
-        to_check[#to_check + 1] = id
-    end
+    for id in pairs(pending_restarts) do to_check[#to_check + 1] = id end
     for _, id in ipairs(to_check) do
         local output = get_output(id)
         if not output then
             pending_restarts[id] = nil
         elseif not obs.obs_output_active(output) then
             pending_restarts[id] = nil
-            if not start_output_by_id(id, true) then
-                pending_restarts[id] = true
-            end
+            if not start_output_by_id(id, true) then pending_restarts[id] = true end
         end
     end
 end
@@ -717,24 +906,24 @@ function script_unload()
         obs.obs_frontend_remove_event_callback(event_callback)
         event_callback = nil
     end
+    set_reset_state("idle", "unload")
+    unsubscribe_main()
     force_stop_outputs()
     for _, id in ipairs(BUFFER_IDS) do
         disconnect_output_signals(id)
         local output = outputs[id]
-        if output then
-            obs.obs_output_release(output)
-            outputs[id] = nil
-        end
+        if output then obs.obs_output_release(output); outputs[id] = nil end
     end
     shared_memory_queue = {}
+    child_saved_queue = {}
     pending_saves = {}
     pending_restarts = {}
+    finalize_queue = {}
     output_signals = {}
-    main_reset_pending = false
-    main_stopped_by_reset = false
-    pending_main_restart = false
-    last_main_restart_try = 0
-    exit_in_progress = false
+    child_deactivated = {}
+    buffer_start_time = {}
+    main_buffer_start_time = nil
+    T_save_request = {}
     bridge_close()
     notify_close()
 end

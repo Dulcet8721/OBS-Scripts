@@ -195,7 +195,7 @@ local WIN = {
     SUB_COLOR = rgb(200, 200, 200),
     STRIPE_COLOR = rgb(115, 180, 0),
     SRCCOPY = 0x00CC0020,
-    WM_CLOSE = 0x0010,
+    WM_CLOSE = 0x0010
 }
 
 local PANEL_W = 350
@@ -350,12 +350,12 @@ end
 local function sfo_status_read()
     local h = kernel32.OpenFileMappingW(0x000F001F, 0, bridge_wide(SFO_STATUS_NAME))
     if h == nil or h == ffi.cast("HANDLE", 0) then
-        return { live = false, enabled = false }
+        return {live = false, enabled = false}
     end
     local v = kernel32.MapViewOfFile(h, 0x000F001F, 0, 0, SFO_STATUS_SIZE)
     if v == nil then
         kernel32.CloseHandle(h)
-        return { live = false, enabled = false }
+        return {live = false, enabled = false}
     end
     local hdr = ffi.cast("unsigned int*", v)
     local version = tonumber(hdr[0])
@@ -363,7 +363,16 @@ local function sfo_status_read()
     kernel32.UnmapViewOfFile(v)
     kernel32.CloseHandle(h)
     if version ~= 1 then return { live = false, enabled = false } end
-    return { live = true, enabled = enabled == 1 }
+    return {live = true, enabled = enabled == 1}
+end
+
+local function pr_is_active()
+    local h = kernel32.OpenFileMappingW(0x0004, 0, bridge_wide(PR_NOTIFY_NAME))
+    if h == nil or h == ffi.cast("HANDLE", 0) then
+        return false
+    end
+    kernel32.CloseHandle(h)
+    return true
 end
 
 local function sfo_moved_read_new()
@@ -402,7 +411,7 @@ local function sfo_moved_read_new()
                 ffi.copy(ibuf, slot + 12 + plen, ilen)
                 info = ffi.string(ibuf, ilen)
             end
-            events[#events + 1] = { path = path, info = info, status = status }
+            events[#events + 1] = {path = path, info = info, status = status}
         end
         STATE.sfo_moved_rs = STATE.sfo_moved_rs + 1
     end
@@ -578,10 +587,7 @@ end
 local function prepare_fonts()
     local s = CONFIG.scale / 100.0
     if STATE.title_font == nil then
-        STATE.title_font = gdi32.CreateFontA(
-            math.floor(HEADING_PX * s), 0, 0, 0, WIN.FW_BOLD, 0, 0, 0,
-            WIN.DEFAULT_CHARSET, WIN.OUT_DEFAULT_PRECIS, WIN.CLIP_DEFAULT_PRECIS,
-            WIN.CLEARTYPE_QUALITY, WIN.DEFAULT_PITCH, "Segoe UI")
+        STATE.title_font = gdi32.CreateFontA(math.floor(HEADING_PX * s), 0, 0, 0, WIN.FW_BOLD, 0, 0, 0, WIN.DEFAULT_CHARSET, WIN.OUT_DEFAULT_PRECIS, WIN.CLIP_DEFAULT_PRECIS, WIN.CLEARTYPE_QUALITY, WIN.DEFAULT_PITCH, "Segoe UI")
     end
     if STATE.body_font == nil then
         STATE.body_font = gdi32.CreateFontA(math.floor(BODY_PX * s), 0, 0, 0, 400, 0, 0, 0, WIN.DEFAULT_CHARSET, WIN.OUT_DEFAULT_PRECIS, WIN.CLIP_DEFAULT_PRECIS, WIN.CLEARTYPE_QUALITY, WIN.DEFAULT_PITCH, "Segoe UI")
@@ -791,6 +797,9 @@ end
 local function on_frontend_event(event)
     if STATE.exiting then return end
     if event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED then
+        if pr_is_active() then
+            return
+        end
         local path = obs.obs_frontend_get_last_replay()
         handle_obs_event(title_for_replay(), path, "replay")
     elseif event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED then
@@ -835,7 +844,12 @@ end
 local function process_pr_notify_events()
     local events = pr_notify_read_new()
     for _, ev in ipairs(events) do
-        local title = title_for_partial(ev.duration)
+        local title
+        if ev.duration and ev.duration > 0 then
+            title = title_for_partial(ev.duration)
+        else
+            title = title_for_replay()
+        end
         local sfo = sfo_status_read()
         if sfo.live and sfo.enabled then
             enqueue_pending(title, ev.path)
