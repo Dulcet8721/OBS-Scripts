@@ -90,12 +90,13 @@
 
 | Скрипт | Минимальная версия OBS | Платформа |
 | :--- | :--- | :--- |
+| External FFmpeg Compress | 21.0.0+ | Windows |
+| Notifier | 29.0.0+ | Windows |
 | Partial Replay | 30.2.0+ | Windows |
 | Smart File Organizer | 30.2.0+ | Windows |
-| Notifier | 29.0.0+ | Windows |
-| External FFmpeg Compress | 21.0.0+ | Windows |
 | Source Switcher | 29.0.0+ | Windows |
 | Toggle OBS UI | 21.0.0+ | Windows |
+| Trim Replay | 33.0.0+ | Windows |
 
 ---
 
