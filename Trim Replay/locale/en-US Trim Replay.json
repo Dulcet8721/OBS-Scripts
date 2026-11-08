@@ -1,0 +1,14 @@
+{
+  "ScriptDescription": " ",
+  "GroupControl": "Trim replay control",
+  "Enabled": "Enable trim replay",
+  "ResetAfterSave": "Prevent overlap between clips",
+  "GroupLengths": "Clip length settings",
+  "Clip1": "Clip 1 (seconds)",
+  "Clip2": "Clip 2 (seconds)",
+  "Clip3": "Clip 3 (seconds)",
+  "LengthsInfo": "Values of 0 and >= the main buffer length fully disable the clip for which an invalid value is set.",
+  "HotkeySave": "Save clip %d (%s)",
+  "Disabled": "disabled",
+  "SecondsFormat": "%d sec"
+}
