@@ -245,8 +245,8 @@ function script_defaults(settings)
 end
 
 function script_unload()
-    if default_loc then obs.obs_data_release(default_loc) default_loc = nil end
-    if current_loc then obs.obs_data_release(current_loc) current_loc = nil end
+    if default_loc then pcall(obs.obs_data_release, default_loc); default_loc = nil end
+    if current_loc then pcall(obs.obs_data_release, current_loc); current_loc = nil end
 end
 
 function script_properties()

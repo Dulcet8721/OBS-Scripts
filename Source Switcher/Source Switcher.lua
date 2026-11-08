@@ -694,9 +694,14 @@ local function on_scene_changed(event, data)
             refresh_switcher()
             check_display_source()
         end
+    elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
+        if scene_change_connected and scene_change_callback then
+            pcall(obs.obs_frontend_remove_event_callback, scene_change_callback)
+            scene_change_connected = false
+            scene_change_callback = nil
+        end
     end
 end
-
 function script_tick(seconds)
     tick_display_check()
     if not obs_fully_loaded then
@@ -834,19 +839,11 @@ function script_defaults(settings)
 end
 
 function script_unload()
-    disconnect_scene_signals()
-    disconnect_signals_switcher()
-    clear_window_sources_data()
     active = false
     game_item = nil
     display_item = nil
-    if scene_change_connected and scene_change_callback then
-        obs.obs_frontend_remove_event_callback(scene_change_callback)
-        scene_change_connected = false
-        scene_change_callback = nil
-    end
-    if default_loc then obs.obs_data_release(default_loc) default_loc = nil end
-    if current_loc then obs.obs_data_release(current_loc) current_loc = nil end
+    if default_loc then pcall(obs.obs_data_release, default_loc); default_loc = nil end
+    if current_loc then pcall(obs.obs_data_release, current_loc); current_loc = nil end
 end
 
 function script_properties()

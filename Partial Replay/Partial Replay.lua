@@ -9,11 +9,13 @@ local SAFETY_TIMEOUT_MS = 30000
 local START_RETRY_AFTER_MS = 3000
 local START_MAX_ATTEMPTS = 2
 local FILE_STABLE_TICKS = 5
+local FINALIZE_TIMEOUT_MS = 15000
 local default_loc = nil
 local current_loc = nil
 local enabled = false
+local effective_enabled = false
 local reset_enabled = false
-local durations = { DEFAULT_DURATIONS[1], DEFAULT_DURATIONS[2], DEFAULT_DURATIONS[3] }
+local durations = {DEFAULT_DURATIONS[1], DEFAULT_DURATIONS[2], DEFAULT_DURATIONS[3]}
 local main_limit = nil
 local outputs = {}
 local output_signals = {}
@@ -43,7 +45,6 @@ local main_start_seen = false
 local main_activate_seen = false
 local reset_state = "idle"
 local state_entered_at = 0
-local last_status_log = 0
 local start_attempts = 0
 local last_start_attempt_at = 0
 local ffi = require("ffi")
@@ -58,6 +59,10 @@ local NOTIFY_SLOT = 1024
 local NOTIFY_SLOTS = 128
 local NOTIFY_TOTAL = NOTIFY_HEADER + NOTIFY_SLOT * NOTIFY_SLOTS
 local NOTIFY_PAYLOAD_MAX = NOTIFY_SLOT - 8
+local PR_STATUS_NAME = "Local\\OBS_PR_Status_v1"
+local PR_STATUS_SIZE = 16
+local TR_STATUS_NAME = "Local\\OBS_TR_Status_v1"
+local TR_STATUS_SIZE = 16
 
 ffi.cdef[[
     typedef void* HANDLE;
@@ -66,6 +71,7 @@ ffi.cdef[[
     typedef const unsigned short* LPCWSTR;
     typedef size_t SIZE_T;
     HANDLE CreateFileMappingW(HANDLE, void*, DWORD, DWORD, DWORD, LPCWSTR);
+    HANDLE OpenFileMappingW(DWORD, BOOL, LPCWSTR);
     void* MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
     BOOL UnmapViewOfFile(void*);
     BOOL CloseHandle(HANDLE);
@@ -74,6 +80,7 @@ ffi.cdef[[
 local kernel32 = ffi.load("kernel32")
 local bridge_handle, bridge_view, bridge_hdr = nil, nil, nil
 local notify_handle, notify_view, notify_hdr = nil, nil, nil
+local pr_status_handle, pr_status_view, pr_status_hdr = nil, nil, nil
 
 local function bridge_wide(s)
     local b = ffi.new("unsigned short[?]", #s + 1)
@@ -147,6 +154,60 @@ local function notify_write(path, duration_sec)
     ffi.cast("unsigned int*", slot + 4)[0] = plen
     ffi.copy(slot + 8, path, plen)
     notify_hdr[0] = ws + 1
+end
+
+local function pr_status_open()
+    if pr_status_view then return true end
+    pr_status_handle = kernel32.CreateFileMappingW(ffi.cast("HANDLE", -1), nil, 0x04, 0, PR_STATUS_SIZE, bridge_wide(PR_STATUS_NAME))
+    if pr_status_handle == nil or pr_status_handle == ffi.cast("HANDLE", 0) then
+        pr_status_handle = nil; return false
+    end
+    pr_status_view = kernel32.MapViewOfFile(pr_status_handle, 0x000F001F, 0, 0, PR_STATUS_SIZE)
+    if pr_status_view == nil then
+        kernel32.CloseHandle(pr_status_handle); pr_status_handle = nil; return false
+    end
+    pr_status_hdr = ffi.cast("unsigned int*", pr_status_view)
+    pr_status_hdr[0] = 1
+    pr_status_hdr[1] = enabled and 1 or 0
+    pr_status_hdr[2] = 0
+    pr_status_hdr[3] = 0
+    return true
+end
+
+local function pr_status_update()
+    if not pr_status_hdr then return end
+    pr_status_hdr[1] = enabled and 1 or 0
+    pr_status_hdr[2] = effective_enabled and 1 or 0
+    pr_status_hdr[3] = reset_enabled and 1 or 0
+end
+
+local function pr_status_close()
+    if pr_status_view then kernel32.UnmapViewOfFile(pr_status_view); pr_status_view = nil end
+    if pr_status_handle then kernel32.CloseHandle(pr_status_handle); pr_status_handle = nil end
+    pr_status_hdr = nil
+end
+
+local function tr_status_read()
+    local h = kernel32.OpenFileMappingW(0x0004, 0, bridge_wide(TR_STATUS_NAME))
+    if h == nil or h == ffi.cast("HANDLE", 0) then
+        return {live = false, enabled = false, effective = false, dangerous = false}
+    end
+    local v = kernel32.MapViewOfFile(h, 0x0004, 0, 0, TR_STATUS_SIZE)
+    if v == nil then
+        kernel32.CloseHandle(h)
+        return {live = false, enabled = false, effective = false, dangerous = false}
+    end
+    local hdr = ffi.cast("unsigned int*", v)
+    local version = tonumber(hdr[0])
+    local en = tonumber(hdr[1])
+    local eff = tonumber(hdr[2])
+    local dangerous = tonumber(hdr[3])
+    kernel32.UnmapViewOfFile(v)
+    kernel32.CloseHandle(h)
+    if version ~= 1 then
+        return {live = false, enabled = false, effective = false, dangerous = false}
+    end
+    return {live = true, enabled = en == 1, effective = eff == 1, dangerous = dangerous == 1}
 end
 
 local function now_ms()
@@ -270,7 +331,6 @@ local function set_reset_state(s, reason)
     if reset_state == s then return end
     reset_state = s
     state_entered_at = now_ms()
-    last_status_log = 0
 end
 
 local function try_call_start(now)
@@ -281,7 +341,7 @@ local function try_call_start(now)
 end
 
 local function enqueue_finalize(id, path, duration, T_save)
-    finalize_queue[#finalize_queue + 1] = {id = id, path = path, duration = duration or 0, T_save = T_save, last_size = -1, stable_ticks = 0}
+    finalize_queue[#finalize_queue + 1] = {id = id, path = path, duration = duration or 0, T_save = T_save, last_size = -1, stable_ticks = 0, deadline = now_ms() + FINALIZE_TIMEOUT_MS}
 end
 
 local function push_shared_memory(path, duration)
@@ -304,11 +364,18 @@ end
 
 local function tick_finalize_queue()
     if #finalize_queue == 0 then return end
+    local now = now_ms()
     local remaining = {}
     for _, entry in ipairs(finalize_queue) do
+        local expired = entry.deadline and now >= entry.deadline
         local size = get_file_size(entry.path)
         if size == nil then
-            remaining[#remaining + 1] = entry
+            if expired then
+                if entry.id ~= "main" then pending_saves[entry.id] = nil end
+                handle_saved_finalized(entry.id, entry.T_save, entry.duration, nil)
+            else
+                remaining[#remaining + 1] = entry
+            end
         else
             if size == entry.last_size then
                 entry.stable_ticks = entry.stable_ticks + 1
@@ -316,7 +383,7 @@ local function tick_finalize_queue()
                 entry.last_size = size
                 entry.stable_ticks = 0
             end
-            if entry.stable_ticks >= FILE_STABLE_TICKS then
+            if entry.stable_ticks >= FILE_STABLE_TICKS or expired then
                 finalize_and_handle(entry)
             else
                 remaining[#remaining + 1] = entry
@@ -361,7 +428,7 @@ local function buffer_label(id) return tr("AutoGroupName") end
 local function get_output(id) return outputs[id] end
 
 local function should_start(id, limit)
-    if not enabled then return false end
+    if not effective_enabled then return false end
     local d = durations[id] or 0
     if d <= 0 then return false end
     if limit and limit > 0 and d >= limit then return false end
@@ -478,7 +545,7 @@ end
 
 local function start_outputs(force_restart)
     if force_restart == nil then force_restart = false end
-    if not enabled or not frontend_active() then return false end
+    if not effective_enabled or not frontend_active() then return false end
     local main = get_main_output()
     if not main then return false end
     local main_settings = obs.obs_output_get_settings(main)
@@ -504,7 +571,7 @@ local function start_outputs(force_restart)
 end
 
 start_output_by_id = function(id, force_restart)
-    if not enabled or not frontend_active() then return false end
+    if not effective_enabled or not frontend_active() then return false end
     local main = get_main_output()
     if not main then return false end
     local main_settings = obs.obs_output_get_settings(main)
@@ -565,6 +632,7 @@ get_main_limit = function()
 end
 
 begin_main_reset = function()
+    if not effective_enabled then return end
     if not reset_enabled then return end
     if reset_state ~= "idle" then return end
     subscribe_main()
@@ -654,6 +722,19 @@ local function force_stop_outputs(ids)
     end
 end
 
+local function shutdown_outputs()
+    for _, id in ipairs(BUFFER_IDS) do
+        local output = outputs[id]
+        if output then
+            disconnect_output_signals(id)
+            pcall(obs.obs_output_release, output)
+            outputs[id] = nil
+            buffer_start_time[id] = nil
+        end
+    end
+    output_signals = {}
+end
+
 local function tick_state_machine()
     local now = now_ms()
     if reset_state == "stopping_children" then
@@ -711,9 +792,12 @@ local function tick_state_machine()
     end
 end
 
+local refresh_effective
+
 local function on_frontend_event(event)
     if event == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING then
-        if enabled and frontend_active() then
+        refresh_effective()
+        if effective_enabled and frontend_active() then
             for _, id in ipairs(BUFFER_IDS) do
                 if should_start(id, main_limit) and not child_is_active(id) then
                     pending_restarts[id] = true
@@ -722,9 +806,32 @@ local function on_frontend_event(event)
         end
     elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED then
         main_buffer_start_time = now_ms()
+        if effective_enabled then
+            for _, id in ipairs(BUFFER_IDS) do
+                if should_start(id, main_limit) and not child_is_active(id) then
+                    pending_restarts[id] = true
+                end
+            end
+        end
     elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED then
         T_save_request = {}
+        if reset_state == "idle" then
+            pending_restarts = {}
+            pending_saves = {}
+            for _, id in ipairs(BUFFER_IDS) do
+                local output = outputs[id]
+                if output and obs.obs_output_active(output) then
+                    buffer_start_time[id] = nil
+                    obs.obs_output_force_stop(output)
+                end
+            end
+        end
     elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED then
+        if not effective_enabled then return end
+        local tr = tr_status_read()
+        if tr.live and tr.effective then
+            return
+        end
         local main_output = get_main_output()
         local path = nil
         if main_output then
@@ -738,12 +845,40 @@ local function on_frontend_event(event)
         else
             handle_saved_finalized("main", T_save, duration, nil)
         end
-    elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
-        set_reset_state("idle", "exit")
-        unsubscribe_main()
+	elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
+		if event_callback then
+			obs.obs_frontend_remove_event_callback(event_callback)
+			event_callback = nil
+		end
+		set_reset_state("idle", "exit")
+		unsubscribe_main()
+		force_stop_outputs()
+		T_save_request = {}
+		main_buffer_start_time = nil
+    end
+end
+
+refresh_effective = function()
+    local other = tr_status_read()
+    local mutual = other.live and other.enabled and other.dangerous
+    local new_eff = enabled and not mutual
+    local changed = (new_eff ~= effective_enabled)
+    effective_enabled = new_eff
+    pr_status_update()
+    if not changed then return end
+    if new_eff then
+        if frontend_active() then
+            start_outputs()
+        end
+    else
         force_stop_outputs()
-        T_save_request = {}
-        main_buffer_start_time = nil
+        unsubscribe_main()
+        set_reset_state("idle", "effective disabled")
+        shared_memory_queue = {}
+        child_saved_queue = {}
+        pending_saves = {}
+        pending_restarts = {}
+        finalize_queue = {}
     end
 end
 
@@ -783,12 +918,14 @@ function script_load(settings)
     read_settings(settings)
     bridge_open()
     notify_open()
+    pr_status_open()
+    refresh_effective()
     event_callback = on_frontend_event
     obs.obs_frontend_add_event_callback(event_callback)
     for slot = 1, 3 do
         local key = "partial_replay_hotkey_" .. slot
         local cb = function(pressed)
-            if pressed and enabled then
+            if pressed and effective_enabled then
                 if reset_state ~= "idle" then return end
                 local output = outputs[slot]
                 if output and obs.obs_output_active(output) then
@@ -804,25 +941,27 @@ function script_load(settings)
                 end
             end
         end
-        hotkey_ids[slot] = obs.obs_hotkey_register_frontend(key,
-            tr("HotkeySave", slot, tr("SecondsFormat", durations[slot])), cb)
-        local saved_arr = obs.obs_data_get_array(settings, key)
-        obs.obs_hotkey_load(hotkey_ids[slot], saved_arr)
-        obs.obs_data_array_release(saved_arr)
+        hotkey_ids[slot] = obs.obs_hotkey_register_frontend(key, tr("HotkeySave", slot, tr("SecondsFormat", durations[slot])), cb)
+        local saved_arr = settings and obs.obs_data_get_array(settings, key) or nil
+        if saved_arr then
+            obs.obs_hotkey_load(hotkey_ids[slot], saved_arr)
+            obs.obs_data_array_release(saved_arr)
+        end
     end
 
-    if enabled and frontend_active() then start_outputs() end
+    if effective_enabled and frontend_active() then start_outputs() end
 end
 
 function script_update(settings)
     if not settings then return end
     read_settings(settings)
+    refresh_effective()
     for slot = 1, 3 do
         if hotkey_ids[slot] then
             obs.obs_hotkey_set_description(hotkey_ids[slot], tr("HotkeySave", slot, (durations[slot] > 0 and (not main_limit or durations[slot] < main_limit)) and tr("SecondsFormat", durations[slot]) or tr("Disabled")))
         end
     end
-    if not enabled then
+    if not effective_enabled then
         force_stop_outputs()
         return
     end
@@ -848,6 +987,7 @@ function script_save(settings)
 end
 
 function script_tick(seconds)
+    refresh_effective()
     if #shared_memory_queue > 0 then
         if not bridge_view then bridge_open() end
         if not notify_view then notify_open() end
@@ -883,37 +1023,35 @@ function script_tick(seconds)
     tick_finalize_queue()
     tick_state_machine()
     if reset_state ~= "idle" and reset_state ~= "starting_children" then return end
-    if not next(pending_restarts) then return end
-    if not enabled or not frontend_active() then
+    if not effective_enabled then
         pending_restarts = {}
         return
     end
+    if not frontend_active() then return end
+    if not next(pending_restarts) then return end
     local to_check = {}
     for id in pairs(pending_restarts) do to_check[#to_check + 1] = id end
     for _, id in ipairs(to_check) do
         local output = get_output(id)
         if not output then
             pending_restarts[id] = nil
+            if not start_output_by_id(id, true) then pending_restarts[id] = true end
         elseif not obs.obs_output_active(output) then
             pending_restarts[id] = nil
             if not start_output_by_id(id, true) then pending_restarts[id] = true end
+        else
+            pending_restarts[id] = nil
         end
     end
 end
 
 function script_unload()
-    if event_callback then
-        obs.obs_frontend_remove_event_callback(event_callback)
-        event_callback = nil
-    end
     set_reset_state("idle", "unload")
-    unsubscribe_main()
-    force_stop_outputs()
-    for _, id in ipairs(BUFFER_IDS) do
-        disconnect_output_signals(id)
-        local output = outputs[id]
-        if output then obs.obs_output_release(output); outputs[id] = nil end
-    end
+    if default_loc then pcall(obs.obs_data_release, default_loc); default_loc = nil end
+    if current_loc then pcall(obs.obs_data_release, current_loc); current_loc = nil end
+    pcall(unsubscribe_main)
+    pcall(force_stop_outputs)
+    pcall(shutdown_outputs)
     shared_memory_queue = {}
     child_saved_queue = {}
     pending_saves = {}
@@ -924,6 +1062,7 @@ function script_unload()
     buffer_start_time = {}
     main_buffer_start_time = nil
     T_save_request = {}
-    bridge_close()
-    notify_close()
+    pcall(bridge_close)
+    pcall(notify_close)
+    pcall(pr_status_close)
 end

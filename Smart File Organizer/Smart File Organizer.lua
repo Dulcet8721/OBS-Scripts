@@ -29,6 +29,11 @@ local MOVED_SLOTS = 128
 local MOVED_TOTAL = MOVED_HEADER + MOVED_SLOT * MOVED_SLOTS
 local MOVED_PAYLOAD_MAX = MOVED_SLOT - 12
 local PR_NOTIFY_NAME = "Local\\OBS_PR_Notify_v1"
+local TR_STATUS_NAME = "Local\\OBS_TR_Status_v1"
+local TR_NOTIFY_NAME = "Local\\OBS_TR_Notify_v1"
+local TR_STATUS_SIZE = 16
+local PR_STATUS_NAME = "Local\\OBS_PR_Status_v1"
+local PR_STATUS_SIZE = 16
 local PENDING_REPLAY_MAX_ATTEMPTS = 10
 local CONFIG = {enabled = true,auto_split = false}
 
@@ -69,7 +74,7 @@ local STATE = {
     moved_view = nil,
     moved_hdr = nil,
     pending_replay_path = nil,
-    pending_replay_attempts = 0,
+    pending_replay_attempts = 0
 }
 
 local ffi = require("ffi")
@@ -162,13 +167,36 @@ local function bridge_read_one()
     return ffi.string(buf, len)
 end
 
-local function pr_is_active()
-    local h = kernel32.OpenFileMappingW(0x0004, 0, bridge_wide(PR_NOTIFY_NAME))
-    if h == nil or h == ffi.cast("HANDLE", 0) then
+local function pr_is_processing()
+    local h = kernel32.OpenFileMappingW(0x0004, 0, bridge_wide(PR_STATUS_NAME))
+    if h == nil or h == ffi.cast("HANDLE", 0) then return false end
+    local v = kernel32.MapViewOfFile(h, 0x0004, 0, 0, PR_STATUS_SIZE)
+    if v == nil then
+        kernel32.CloseHandle(h)
         return false
     end
+    local hdr = ffi.cast("unsigned int*", v)
+    local version = tonumber(hdr[0])
+    local eff = tonumber(hdr[2])
+    kernel32.UnmapViewOfFile(v)
     kernel32.CloseHandle(h)
-    return true
+    return version == 1 and eff == 1
+end
+
+local function tr_is_processing()
+    local h = kernel32.OpenFileMappingW(0x0004, 0, bridge_wide(TR_STATUS_NAME))
+    if h == nil or h == ffi.cast("HANDLE", 0) then return false end
+    local v = kernel32.MapViewOfFile(h, 0x0004, 0, 0, TR_STATUS_SIZE)
+    if v == nil then
+        kernel32.CloseHandle(h)
+        return false
+    end
+    local hdr = ffi.cast("unsigned int*", v)
+    local version = tonumber(hdr[0])
+    local eff     = tonumber(hdr[2])
+    kernel32.UnmapViewOfFile(v)
+    kernel32.CloseHandle(h)
+    return version == 1 and eff == 1
 end
 
 local function status_open()
@@ -788,11 +816,12 @@ local function make_capture_callback(source)
 end
 
 local function release_source_signals()
-    for _, info in pairs(STATE.source_signals) do
+    for source, info in pairs(STATE.source_signals) do
         pcall(function()
             obs.signal_handler_disconnect(info.handler, "hooked", info.cb)
             obs.signal_handler_disconnect(info.handler, "unhooked", info.cb)
         end)
+        pcall(obs.obs_source_release, source)
     end
     STATE.source_signals = {}
     STATE.source_exe = {}
@@ -812,6 +841,7 @@ local function rescan_sources()
                 local cb = make_capture_callback(source)
                 if obs.signal_handler_connect(handler, "hooked", cb) then
                     obs.signal_handler_connect(handler, "unhooked", cb)
+                    obs.obs_source_get_ref(source)
                     STATE.source_signals[source] = { handler = handler, cb = cb }
                 end
                 local hooked, exe = get_hooked_info(source)
@@ -840,6 +870,10 @@ local function queue_file(path, media_type, context)
 end
 
 local function process_file(job)
+    if not CONFIG.enabled then return true end
+    if job.media_type == "replay" and tr_is_processing() then
+        return true
+    end
     local path = job.path
     if not file_exists(path) then return true end
     local context = job.context
@@ -993,7 +1027,7 @@ local function recording_file_context(directory, allow_stale)
     if source then
         return {known = true, matched = source.matched and true or false, folder = source.folder, exe = source.exe, base_dir = directory}
     end
-    return { known = false, base_dir = directory }
+    return {known = false, base_dir = directory}
 end
 
 on_recording_file_changed = function(calldata)
@@ -1220,7 +1254,7 @@ local function on_frontend_event(event)
             on_recording_stopped()
         end
     elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED then
-        if CONFIG.enabled and not pr_is_active() then
+        if CONFIG.enabled and not pr_is_processing() and not tr_is_processing() then
             local path = obs.obs_frontend_get_last_replay()
             if path and path ~= "" then
                 STATE.pending_replay_path = path
@@ -1235,11 +1269,15 @@ local function on_frontend_event(event)
                 queue_file(path, "screenshot", snapshot_context())
             end
         end
-    elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
-        STATE.exiting = true
-        disconnect_recording()
-        STATE.pending_replay_path = nil
-        STATE.pending_replay_attempts = 0
+	elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
+		STATE.exiting = true
+		if STATE.event_callback then
+			obs.obs_frontend_remove_event_callback(STATE.event_callback)
+			STATE.event_callback = nil
+		end
+		disconnect_recording()
+		STATE.pending_replay_path = nil
+		STATE.pending_replay_attempts = 0
     end
 end
 
@@ -1411,15 +1449,13 @@ function script_tick(seconds)
 end
 
 function script_unload()
-    if STATE.event_callback then
-        obs.obs_frontend_remove_event_callback(STATE.event_callback)
-        STATE.event_callback = nil
-    end
-    disconnect_recording()
-    release_source_signals()
-    bridge_close()
-    status_close()
-    moved_close()
+    pcall(disconnect_recording)
+    pcall(release_source_signals)
+    if default_loc then pcall(obs.obs_data_release, default_loc); default_loc = nil end
+    if current_loc then pcall(obs.obs_data_release, current_loc); current_loc = nil end
+    pcall(bridge_close)
+    pcall(status_close)
+    pcall(moved_close)
     STATE.queue = {}
     STATE.seen = {}
     STATE.pending_replay_path = nil

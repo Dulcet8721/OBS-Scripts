@@ -219,7 +219,8 @@ local function finalize_compression_success()
     local st = comp_state
     comp_state = nil
     local clean = st.output_path:gsub("/", "\\")
-    spawn_hidden('explorer.exe /select,"' .. clean .. '"')
+    local h = spawn_hidden('explorer.exe /select,"' .. clean .. '"')
+    if h then kernel32.CloseHandle(h) end
 end
 
 local function finalize_compression_failure()
@@ -355,12 +356,11 @@ end
 
 function script_update(settings)
     if not settings then return end
+    obs.obs_data_addref(settings)
     if global_settings then
         obs.obs_data_release(global_settings)
-        global_settings = nil
     end
     global_settings = settings
-    obs.obs_data_addref(global_settings)
     input_file = obs.obs_data_get_string(settings, "input_file")
     if obs.obs_data_has_user_value(settings, "crf_value") then
         crf_value = obs.obs_data_get_int(settings, "crf_value")
@@ -387,21 +387,15 @@ end
 
 function script_unload()
     if comp_state and comp_state.process_handle then
-        kill_process(comp_state.process_handle)
-        close_process(comp_state.process_handle)
-        comp_state.process_handle = nil
+        pcall(kill_process, comp_state.process_handle)
+        pcall(close_process, comp_state.process_handle)
     end
     comp_state = nil
-    if is_valid_handle(nul_handle) then
-        close_process(nul_handle)
-    end
+    if is_valid_handle(nul_handle) then pcall(kernel32.CloseHandle, nul_handle) end
     nul_handle = nil
-    if global_settings then
-        obs.obs_data_release(global_settings)
-        global_settings = nil
-    end
-    if default_loc then obs.obs_data_release(default_loc) default_loc = nil end
-    if current_loc then obs.obs_data_release(current_loc) current_loc = nil end
+    if global_settings then pcall(obs.obs_data_release, global_settings); global_settings = nil end
+    if default_loc then pcall(obs.obs_data_release, default_loc); default_loc = nil end
+    if current_loc then pcall(obs.obs_data_release, current_loc); current_loc = nil end
 end
 
 function script_properties()

@@ -2,7 +2,7 @@
   "ScriptDescription": " ",
   "GroupControl": "Partial replay control",
   "Enabled": "Enable partial replay",
-  "ResetAfterSave": "Clear buffers after saving",
+  "ResetAfterSave": "Prevent overlap between buffers",
   "GroupLengths": "Partial replay length settings",
   "Clip1": "Partial replay 1 (seconds)",
   "Clip2": "Partial replay 2 (seconds)",
