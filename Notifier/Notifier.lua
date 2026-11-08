@@ -14,6 +14,16 @@ local PR_NOTIFY_SLOT = 1024
 local PR_NOTIFY_SLOTS = 128
 local PR_NOTIFY_TOTAL = PR_NOTIFY_HEADER + PR_NOTIFY_SLOT * PR_NOTIFY_SLOTS
 local PR_NOTIFY_PAYLOAD_MAX = PR_NOTIFY_SLOT - 8
+local TR_NOTIFY_NAME = "Local\\OBS_TR_Notify_v1"
+local TR_NOTIFY_HEADER = 8
+local TR_NOTIFY_SLOT = 1024
+local TR_NOTIFY_SLOTS = 128
+local TR_NOTIFY_TOTAL = TR_NOTIFY_HEADER + TR_NOTIFY_SLOT * TR_NOTIFY_SLOTS
+local TR_NOTIFY_PAYLOAD_MAX = TR_NOTIFY_SLOT - 8
+local TR_STATUS_NAME = "Local\\OBS_TR_Status_v1"
+local TR_STATUS_SIZE = 16
+local PR_STATUS_NAME = "Local\\OBS_PR_Status_v1"
+local PR_STATUS_SIZE = 16
 local UTF8_CP = 65001
 local WND_CLASS_NAME = "NotifierAlertBox"
 local WND_TITLE_NAME = "NotifierAlert"
@@ -24,12 +34,13 @@ local CONFIG = {
     scale = 100,
     position = "top_right",
     duration = 3.0,
-    sound_file = "",
+    sound_file = ""
 }
 
 local STATE = {
     sfo_moved_rs = nil,
     pr_notify_rs = nil,
+    tr_notify_rs = nil,
     pending = {},
     alert_queue = {},
     active_alert = nil,
@@ -51,7 +62,7 @@ local STATE = {
     backbuffer_bitmap = nil,
     backbuffer_prev = nil,
     backbuffer_w = 0,
-    backbuffer_h = 0,
+    backbuffer_h = 0
 }
 
 local ffi = require("ffi")
@@ -135,7 +146,7 @@ ffi.cdef[[
     int DrawTextA(HDC, LPCSTR, int, RECT*, UINT);
     HBRUSH CreateSolidBrush(COLORREF);
     int FillRect(HDC, const RECT*, HBRUSH);
-    BOOL PlaySoundA(LPCSTR, HINSTANCE, DWORD);
+    BOOL PlaySoundW(LPCWSTR, HINSTANCE, DWORD);
     typedef struct {
         DWORD dwFileAttributes;
         DWORD ftCreationTime_L; DWORD ftCreationTime_H;
@@ -366,13 +377,36 @@ local function sfo_status_read()
     return {live = true, enabled = enabled == 1}
 end
 
-local function pr_is_active()
-    local h = kernel32.OpenFileMappingW(0x0004, 0, bridge_wide(PR_NOTIFY_NAME))
-    if h == nil or h == ffi.cast("HANDLE", 0) then
+local function pr_is_processing()
+    local h = kernel32.OpenFileMappingW(0x0004, 0, bridge_wide(PR_STATUS_NAME))
+    if h == nil or h == ffi.cast("HANDLE", 0) then return false end
+    local v = kernel32.MapViewOfFile(h, 0x0004, 0, 0, PR_STATUS_SIZE)
+    if v == nil then
+        kernel32.CloseHandle(h)
         return false
     end
+    local hdr = ffi.cast("unsigned int*", v)
+    local version = tonumber(hdr[0])
+    local eff = tonumber(hdr[2])
+    kernel32.UnmapViewOfFile(v)
     kernel32.CloseHandle(h)
-    return true
+    return version == 1 and eff == 1
+end
+
+local function tr_is_processing()
+    local h = kernel32.OpenFileMappingW(0x0004, 0, bridge_wide(TR_STATUS_NAME))
+    if h == nil or h == ffi.cast("HANDLE", 0) then return false end
+    local v = kernel32.MapViewOfFile(h, 0x0004, 0, 0, TR_STATUS_SIZE)
+    if v == nil then
+        kernel32.CloseHandle(h)
+        return false
+    end
+    local hdr = ffi.cast("unsigned int*", v)
+    local version = tonumber(hdr[0])
+    local eff     = tonumber(hdr[2])
+    kernel32.UnmapViewOfFile(v)
+    kernel32.CloseHandle(h)
+    return version == 1 and eff == 1
 end
 
 local function sfo_moved_read_new()
@@ -448,9 +482,42 @@ local function pr_notify_read_new()
         if plen > 0 and plen <= PR_NOTIFY_PAYLOAD_MAX then
             local pbuf = ffi.new("char[?]", plen)
             ffi.copy(pbuf, slot + 8, plen)
-            events[#events + 1] = { path = ffi.string(pbuf, plen), duration = dur }
+            events[#events + 1] = {path = ffi.string(pbuf, plen), duration = dur}
         end
         STATE.pr_notify_rs = STATE.pr_notify_rs + 1
+    end
+    kernel32.UnmapViewOfFile(v)
+    kernel32.CloseHandle(h)
+    return events
+end
+
+local function tr_notify_read_new()
+    local h = kernel32.OpenFileMappingW(0x000F001F, 0, bridge_wide(TR_NOTIFY_NAME))
+    if h == nil or h == ffi.cast("HANDLE", 0) then
+        STATE.tr_notify_rs = nil
+        return {}
+    end
+    local v = kernel32.MapViewOfFile(h, 0x000F001F, 0, 0, TR_NOTIFY_TOTAL)
+    if v == nil then
+        kernel32.CloseHandle(h)
+        return {}
+    end
+    local hdr = ffi.cast("unsigned int*", v)
+    local ws = tonumber(hdr[0]) or 0
+    local events = {}
+    if STATE.tr_notify_rs == nil then STATE.tr_notify_rs = ws end
+    if STATE.tr_notify_rs > ws then STATE.tr_notify_rs = ws end
+    while STATE.tr_notify_rs < ws do
+        local idx = STATE.tr_notify_rs % TR_NOTIFY_SLOTS
+        local slot = ffi.cast("unsigned char*", v) + TR_NOTIFY_HEADER + idx * TR_NOTIFY_SLOT
+        local dur = tonumber(ffi.cast("unsigned int*", slot)[0])
+        local plen = tonumber(ffi.cast("unsigned int*", slot + 4)[0])
+        if plen > 0 and plen <= TR_NOTIFY_PAYLOAD_MAX then
+            local pbuf = ffi.new("char[?]", plen)
+            ffi.copy(pbuf, slot + 8, plen)
+            events[#events + 1] = { path = ffi.string(pbuf, plen), duration = dur }
+        end
+        STATE.tr_notify_rs = STATE.tr_notify_rs + 1
     end
     kernel32.UnmapViewOfFile(v)
     kernel32.CloseHandle(h)
@@ -461,7 +528,7 @@ local function list_sound_files()
     local dir = (script_path():match("(.*[/\\])") or "") .. "notification sounds"
     local files = {}
     local pattern = dir .. "\\*.wav"
-    local wsearch = bridge_wide(pattern)
+    local wsearch = wide(pattern)
     if not wsearch then return files end
     local data = ffi.new("WIN32_FIND_DATAW")
     local h = kernel32.FindFirstFileW(wsearch, data)
@@ -633,7 +700,7 @@ local function ensure_notification_class()
     local wc = ffi.new("WNDCLASSEXA")
     wc.cbSize = ffi.sizeof("WNDCLASSEXA")
     wc.style = WIN.CS_HREDRAW + WIN.CS_VREDRAW
-    wc.lpfnWndProc = user32.DefWindowProcA
+    wc.lpfnWndProc = ffi.cast("WNDPROC", user32.DefWindowProcA) -- Явное приведение типов для безопасности
     wc.hInstance = STATE.popup_hinstance
     wc.hbrBackground = nil
     wc.lpszClassName = WND_CLASS_NAME
@@ -665,14 +732,6 @@ local function ensure_notification_window()
     return STATE.popup_hwnd
 end
 
-local function destroy_notification_window()
-    destroy_memdc()
-    if STATE.popup_hwnd and user32.IsWindow(STATE.popup_hwnd) then
-        user32.DestroyWindow(STATE.popup_hwnd)
-    end
-    STATE.popup_hwnd = nil
-end
-
 local function play_alert()
     if not CONFIG.sound_enabled then return end
     if winmm == nil then return end
@@ -680,8 +739,9 @@ local function play_alert()
     local dir = (script_path():match("(.*[/\\])") or "") .. "notification sounds\\"
     local full = dir .. CONFIG.sound_file
     pcall(function()
-        if not wide(full) then return end
-        winmm.PlaySoundA(full, nil, WIN.SND_FILENAME + WIN.SND_ASYNC + WIN.SND_NODEFAULT)
+        local wpath = wide(full)
+        if not wpath then return end
+        winmm.PlaySoundW(wpath, nil, WIN.SND_FILENAME + WIN.SND_ASYNC + WIN.SND_NODEFAULT)
     end)
 end
 
@@ -694,6 +754,7 @@ local function apply_alpha(v)
 end
 
 local function advance_queue()
+    if STATE.exiting then return end
     if STATE.active_alert ~= nil then return end
     if #STATE.alert_queue == 0 then return end
     local item = table.remove(STATE.alert_queue, 1)
@@ -722,6 +783,7 @@ local function advance_queue()
 end
 
 local function step_animation()
+    if STATE.exiting then return end
     if STATE.active_alert == nil then
         advance_queue()
         return
@@ -770,6 +832,14 @@ local function title_for_partial(dur)
     return string.format(fmt, dur)
 end
 
+local function title_for_clip(dur)
+    if dur and dur > 0 then
+        local fmt = getString("ClipFormat")
+        return string.format(fmt, dur)
+    end
+    return title_for_replay()
+end
+
 local function body_saved_to(folder)
     local fmt = getString("SavedToFormat")
     return string.format(fmt, folder or "?")
@@ -786,6 +856,7 @@ end
 
 local function handle_obs_event(kind, path, media_type)
     if not path or path == "" then return end
+    path = normalize_slashes(path)
     local sfo = sfo_status_read()
     if sfo.live and sfo.enabled then
         enqueue_pending(kind, path)
@@ -797,9 +868,8 @@ end
 local function on_frontend_event(event)
     if STATE.exiting then return end
     if event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED then
-        if pr_is_active() then
-            return
-        end
+        if pr_is_processing() then return end
+        if tr_is_processing() then return end
         local path = obs.obs_frontend_get_last_replay()
         handle_obs_event(title_for_replay(), path, "replay")
     elseif event == obs.OBS_FRONTEND_EVENT_RECORDING_STOPPED then
@@ -810,6 +880,7 @@ local function on_frontend_event(event)
         handle_obs_event(title_for_screenshot(), path, "screenshot")
     elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
         STATE.exiting = true
+        -- ВАЖНО: Мы больше не удаляем колбэк здесь! Это ломало итератор событий OBS.
     end
 end
 
@@ -827,7 +898,8 @@ end
 local function process_sfo_moved_events()
     local events = sfo_moved_read_new()
     for _, ev in ipairs(events) do
-        local pending = STATE.pending[ev.path]
+        local key = normalize_slashes(ev.path)
+        local pending = STATE.pending[key]
         if pending then
             local body
             if ev.status == 1 then
@@ -836,7 +908,7 @@ local function process_sfo_moved_events()
                 body = body_saved_to(ev.info ~= "" and ev.info or "OBS")
             end
             enqueue_alert(pending.title, body)
-            STATE.pending[ev.path] = nil
+            STATE.pending[key] = nil
         end
     end
 end
@@ -850,6 +922,20 @@ local function process_pr_notify_events()
         else
             title = title_for_replay()
         end
+        local sfo = sfo_status_read()
+        if sfo.live and sfo.enabled then
+            enqueue_pending(title, ev.path)
+        else
+            local folder = root_folder_basename("replay", ev.path)
+            enqueue_alert(title, body_saved_to(folder))
+        end
+    end
+end
+
+local function process_tr_notify_events()
+    local events = tr_notify_read_new()
+    for _, ev in ipairs(events) do
+        local title = title_for_clip(ev.duration)
         local sfo = sfo_status_read()
         if sfo.live and sfo.enabled then
             enqueue_pending(title, ev.path)
@@ -938,6 +1024,7 @@ end
 
 function script_load(settings)
     init_locale()
+    STATE.exiting = false
     STATE.sound_files = list_sound_files()
     read_settings(settings)
     prepare_fonts()
@@ -972,29 +1059,27 @@ function script_save(settings)
 end
 
 function script_tick(seconds)
+    if STATE.exiting then return end
     pcall(process_pr_notify_events)
+    pcall(process_tr_notify_events)
     pcall(process_sfo_moved_events)
     pcall(resolve_pending_if_sfo_down)
 end
 
 function script_unload()
-    if STATE.event_callback then
-        obs.obs_frontend_remove_event_callback(STATE.event_callback)
-        STATE.event_callback = nil
+    STATE.exiting = true
+    pcall(obs.timer_remove, step_animation)
+    if STATE.popup_hwnd and user32.IsWindow(STATE.popup_hwnd) then
+        pcall(user32.ShowWindow, STATE.popup_hwnd, WIN.SW_HIDE)
     end
-    obs.timer_remove(step_animation)
-    destroy_notification_window()
-    if STATE.title_font then
-        gdi32.DeleteObject(STATE.title_font)
-        STATE.title_font = nil
-    end
-    if STATE.body_font then
-        gdi32.DeleteObject(STATE.body_font)
-        STATE.body_font = nil
-    end
-    if STATE.popup_class_atom and STATE.popup_hinstance then
-        pcall(user32.UnregisterClassA, WND_CLASS_NAME, STATE.popup_hinstance)
-    end
+    pcall(destroy_memdc)
+    if STATE.title_font then pcall(gdi32.DeleteObject, STATE.title_font) end
+    if STATE.body_font then pcall(gdi32.DeleteObject, STATE.body_font) end
+    if default_loc then pcall(obs.obs_data_release, default_loc); default_loc = nil end
+    if current_loc then pcall(obs.obs_data_release, current_loc); current_loc = nil end
+    STATE.popup_hwnd = nil
+    STATE.title_font = nil
+    STATE.body_font = nil
     STATE.popup_class_atom = nil
     STATE.popup_hinstance = nil
     STATE.pending = {}
