@@ -275,6 +275,7 @@ local function main_is_active() return frontend_active() end
 local function child_is_active(id)
     local o = outputs[id]
     if not o then return false end
+    if buffer_start_time[id] == nil then return false end
     local ok, a = pcall(obs.obs_output_active, o)
     return ok and a == true
 end
@@ -504,8 +505,10 @@ local function start_single_output(id, ctx, force_restart)
     connect_output_signals(id, output)
     if obs.obs_output_active(output) and force_restart then
         pending_restarts[id] = true
-        buffer_start_time[id] = nil
-        obs.obs_output_force_stop(output)
+        if buffer_start_time[id] ~= nil then
+            buffer_start_time[id] = nil
+            obs.obs_output_force_stop(output)
+        end
         return false
     end
     if obs.obs_output_active(output) and not force_restart then
@@ -1036,7 +1039,7 @@ function script_tick(seconds)
         if not output then
             pending_restarts[id] = nil
             if not start_output_by_id(id, true) then pending_restarts[id] = true end
-        elseif not obs.obs_output_active(output) then
+        elseif not child_is_active(id) then
             pending_restarts[id] = nil
             if not start_output_by_id(id, true) then pending_restarts[id] = true end
         else
