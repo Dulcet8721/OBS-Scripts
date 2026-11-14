@@ -429,17 +429,62 @@ local function frontend_active()
 end
 
 local function get_main_limit()
+    local active = frontend_active()
+    local output_limit, output_known = nil, false
     local main = obs.obs_frontend_get_replay_buffer_output()
-    if not main then return nil end
-    local settings = obs.obs_output_get_settings(main)
-    local limit = nil
-    if settings then
-        local l = obs.obs_data_get_int(settings, "max_time_sec")
-        if l and l > 0 then limit = l end
-        obs.obs_data_release(settings)
+    if main then
+        local settings = obs.obs_output_get_settings(main)
+        if settings then
+            output_known = true
+            local l = obs.obs_data_get_int(settings, "max_time_sec")
+            if l and l > 0 then output_limit = l end
+            obs.obs_data_release(settings)
+        end
+        obs.obs_output_release(main)
     end
-    obs.obs_output_release(main)
-    return limit
+    if active and output_known then return output_limit end
+    if obs.obs_frontend_get_profile_config and obs.config_get_int then
+        local config = obs.obs_frontend_get_profile_config()
+        if config then
+            local mode = ""
+            if obs.config_get_string then
+                mode = obs.config_get_string(config, "Output", "Mode") or ""
+            end
+            local sections = {}
+            if tostring(mode):lower() == "advanced" then
+                table.insert(sections, "AdvOut")
+            end
+            table.insert(sections, "SimpleOutput")
+            table.insert(sections, "AdvOut")
+            for _, section in ipairs(sections) do
+                local sec = obs.config_get_int(config, section, "RecRBTime")
+                if sec and sec > 0 then return sec end
+            end
+        end
+    end
+    return output_limit
+end
+
+local function clip_is_valid(slot)
+    local d = durations[slot]
+    if not d or d <= 0 then return false end
+    if main_limit and main_limit > 0 and d >= main_limit then return false end
+    return true
+end
+
+local function hotkey_value_label(slot)
+    if clip_is_valid(slot) then
+        return tr("SecondsFormat", durations[slot])
+    end
+    return tr("Disabled")
+end
+
+local function update_hotkey_descriptions()
+    for slot = 1, 3 do
+        if hotkey_ids[slot] then
+            obs.obs_hotkey_set_description(hotkey_ids[slot], tr("HotkeySave", slot, hotkey_value_label(slot)))
+        end
+    end
 end
 
 local function try_next_save()
@@ -694,6 +739,11 @@ local function on_frontend_event(event)
         refresh_effective()
     elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED then
         last_save_end_time = nil
+        main_limit = get_main_limit()
+        update_hotkey_descriptions()
+    elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED then
+        main_limit = get_main_limit()
+        update_hotkey_descriptions()
     elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVING then
         if not effective_enabled then return end
         if current_save then
@@ -731,15 +781,15 @@ local function on_frontend_event(event)
                 end
             end
         end
-	elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
-		if event_callback then
-			obs.obs_frontend_remove_event_callback(event_callback)
-			event_callback = nil
-		end
-		save_queue = {}
-		current_save = nil
-		pending_main_save = nil
-		trim_queue = {}
+    elseif event == obs.OBS_FRONTEND_EVENT_EXIT then
+        if event_callback then
+            obs.obs_frontend_remove_event_callback(event_callback)
+            event_callback = nil
+        end
+        save_queue = {}
+        current_save = nil
+        pending_main_save = nil
+        trim_queue = {}
         if active_job then
             if active_job.stage_pipe then close_process(active_job.stage_pipe) end
             if active_job.stage_proc then
@@ -823,7 +873,7 @@ function script_load(settings)
     obs.obs_frontend_add_event_callback(event_callback)
     for slot = 1, 3 do
         local key = "trim_replay_hotkey_" .. slot
-        hotkey_ids[slot] = obs.obs_hotkey_register_frontend(key, tr("HotkeySave", slot, tr("SecondsFormat", durations[slot])), on_hotkey(slot))
+        hotkey_ids[slot] = obs.obs_hotkey_register_frontend(key, tr("HotkeySave", slot, hotkey_value_label(slot)), on_hotkey(slot))
         local saved_arr = settings and obs.obs_data_get_array(settings, key) or nil
         if saved_arr then
             obs.obs_hotkey_load(hotkey_ids[slot], saved_arr)
@@ -836,11 +886,7 @@ function script_update(settings)
     if not settings then return end
     read_settings(settings)
     refresh_effective()
-    for slot = 1, 3 do
-        if hotkey_ids[slot] then
-            obs.obs_hotkey_set_description(hotkey_ids[slot], tr("HotkeySave", slot, tr("SecondsFormat", durations[slot])))
-        end
-    end
+    update_hotkey_descriptions()
     if not effective_enabled then
         save_queue = {}
         if not active_job then trim_queue = {} end
