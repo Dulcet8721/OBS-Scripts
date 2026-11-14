@@ -87,6 +87,8 @@ local trim_queue = {}
 local active_job = nil
 local ffprobe_exe = ""
 local ffmpeg_exe = ""
+local ffmpeg_autodetect_done = false
+local ffprobe_autodetect_done = false
 local nul_handle = nil
 local hotkey_ids = {}
 local bridge_handle, bridge_view, bridge_hdr = nil, nil, nil
@@ -131,6 +133,44 @@ local function file_exists(path)
     local f = io.open(path, "r")
     if f then f:close(); return true end
     return false
+end
+
+local function basename(p)
+    return p and p:match("[^/\\]+$") or ""
+end
+
+local function is_tool_name(path, name)
+    return basename(path):lower() == name:lower()
+end
+
+local function find_in_path(exe_name)
+    local env = os.getenv("PATH")
+    if not env then return nil end
+    for dir in env:gmatch("[^;]+") do
+        dir = dir:gsub("^%s+", ""):gsub("%s+$", "")
+        if dir ~= "" then
+            local candidate = dir .. "\\" .. exe_name
+            local f = io.open(candidate, "r")
+            if f then f:close(); return candidate end
+        end
+    end
+    return nil
+end
+
+local function find_next_to_script(exe_name)
+    local d = script_path():match("(.*[/\\])") or ""
+    local candidate = d .. exe_name
+    local f = io.open(candidate, "r")
+    if f then f:close(); return candidate end
+    return nil
+end
+
+local function autodetect_exe(exe_name)
+    return find_in_path(exe_name) or find_next_to_script(exe_name)
+end
+
+local function valid_tool_path(path, expected_name)
+    return path and path ~= "" and is_tool_name(path, expected_name) and file_exists(path)
 end
 
 local function get_file_size(path)
@@ -724,6 +764,10 @@ local function try_next_trim()
     if active_job then return end
     if #trim_queue == 0 then return end
     active_job = table.remove(trim_queue, 1)
+    if not valid_tool_path(ffmpeg_exe, "ffmpeg.exe") or not valid_tool_path(ffprobe_exe, "ffprobe.exe") then
+        active_job.phase = "failed"
+        return
+    end
     local size = get_file_size(active_job.path)
     if not size or size < 1024 then
         active_job.phase = "failed"
@@ -749,7 +793,7 @@ local function on_frontend_event(event)
         if current_save then
             current_save.T_saving = now_ms()
         else
-            pending_main_save = { T_save = now_ms(), T_saving = now_ms() }
+            pending_main_save = {T_save = now_ms(), T_saving = now_ms()}
         end
     elseif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED then
         if not effective_enabled then
@@ -816,6 +860,32 @@ local function read_settings(settings)
         durations[slot] = normalize_duration(obs.obs_data_get_int(settings, "clip" .. slot .. "_seconds"))
     end
     main_limit = get_main_limit()
+    ffmpeg_exe = obs.obs_data_get_string(settings, "ffmpeg_path") or ""
+    ffprobe_exe = obs.obs_data_get_string(settings, "ffprobe_path") or ""
+end
+
+local function autodetect_tools(settings)
+    if not settings then return end
+    if not ffmpeg_autodetect_done then
+        ffmpeg_autodetect_done = true
+        if ffmpeg_exe == "" and not obs.obs_data_has_user_value(settings, "ffmpeg_path") then
+            local found = autodetect_exe("ffmpeg.exe")
+            if found then
+                ffmpeg_exe = found
+                obs.obs_data_set_string(settings, "ffmpeg_path", found)
+            end
+        end
+    end
+    if not ffprobe_autodetect_done then
+        ffprobe_autodetect_done = true
+        if ffprobe_exe == "" and not obs.obs_data_has_user_value(settings, "ffprobe_path") then
+            local found = autodetect_exe("ffprobe.exe")
+            if found then
+                ffprobe_exe = found
+                obs.obs_data_set_string(settings, "ffprobe_path", found)
+            end
+        end
+    end
 end
 
 local function on_hotkey(slot)
@@ -846,6 +916,10 @@ end
 function script_properties()
     init_locale()
     local props = obs.obs_properties_create()
+    local g_ffmpeg = obs.obs_properties_create()
+    obs.obs_properties_add_path(g_ffmpeg, "ffmpeg_path", tr("FFmpegPath"), obs.OBS_PATH_FILE, "Executable files (*.exe);;All files (*.*)", nil)
+    obs.obs_properties_add_path(g_ffmpeg, "ffprobe_path", tr("FFprobePath"), obs.OBS_PATH_FILE, "Executable files (*.exe);;All files (*.*)", nil)
+    obs.obs_properties_add_group(props, "group_ffmpeg", tr("GroupFFmpeg"), obs.OBS_GROUP_NORMAL, g_ffmpeg)
     local control = obs.obs_properties_create()
     obs.obs_properties_add_bool(control, "enabled", tr("Enabled"))
     obs.obs_properties_add_bool(control, "reset_after_save", tr("ResetAfterSave"))
@@ -861,9 +935,6 @@ end
 
 function script_load(settings)
     init_locale()
-    local script_dir = script_path():match("(.*[/\\])") or ""
-    ffprobe_exe = script_dir .. "ffprobe.exe"
-    ffmpeg_exe  = script_dir .. "ffmpeg.exe"
     read_settings(settings)
     bridge_open()
     tr_notify_open()
@@ -885,6 +956,7 @@ end
 function script_update(settings)
     if not settings then return end
     read_settings(settings)
+    autodetect_tools(settings)
     refresh_effective()
     update_hotkey_descriptions()
     if not effective_enabled then
@@ -895,6 +967,8 @@ end
 
 function script_save(settings)
     if not settings then return end
+    obs.obs_data_set_string(settings, "ffmpeg_path", ffmpeg_exe or "")
+    obs.obs_data_set_string(settings, "ffprobe_path", ffprobe_exe or "")
     obs.obs_data_set_bool(settings, "enabled", enabled)
     obs.obs_data_set_bool(settings, "reset_after_save", reset_enabled)
     for slot = 1, 3 do

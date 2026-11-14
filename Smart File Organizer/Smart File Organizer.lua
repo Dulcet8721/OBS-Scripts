@@ -8,7 +8,6 @@ local AUTO_START_RETRY_MS = 1000
 local AUTO_START_MAX_ATTEMPTS = 10
 local AUTO_SPLIT_GRACE_MS = 3000
 local CAPTURE_REFRESH_MS = 1000
-local DESKTOP_FOLDER_NAME = "Desktop"
 local PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 local CP_UTF8 = 65001
 local MAX_PATH_CHARS = 32768
@@ -890,7 +889,11 @@ local function process_file(job)
         end
     end
     if not context.matched or not folder or folder == "" then
-        folder = DESKTOP_FOLDER_NAME
+        local desk_name = getString("DesktopFolderName")
+        if desk_name == "DesktopFolderName" or desk_name == "" then
+            desk_name = "Desktop"
+        end
+        folder = sanitize_folder_name(desk_name) or "Desktop"
     end
     local base = context.base_dir or resolve_base_directory(job.media_type, path)
     if not base or base == "" then base = dirname(path) end

@@ -1,5 +1,7 @@
 {
   "ScriptDescription": " ",
+  "GroupFFmpeg": "FFmpeg",
+  "FFmpegPath": "FFmpeg path",
   "GroupCompress": "Video compression",
   "InputFile": "Select video file",
   "CRFValue": "Compression level (CRF)",

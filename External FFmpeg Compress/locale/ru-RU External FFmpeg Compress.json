@@ -1,5 +1,7 @@
 {
   "ScriptDescription": " ",
+  "GroupFFmpeg": "FFmpeg",
+  "FFmpegPath": "Путь FFmpeg",
   "GroupCompress": "Сжатие видеофайла",
   "InputFile": "Выберите видеофайл",
   "CRFValue": "Степень сжатия (CRF)",

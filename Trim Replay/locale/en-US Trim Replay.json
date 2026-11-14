@@ -1,5 +1,8 @@
 {
   "ScriptDescription": " ",
+  "GroupFFmpeg": "FFmpeg",
+  "FFmpegPath": "FFmpeg path",
+  "FFprobePath": "FFprobe path",
   "GroupControl": "Trim replay control",
   "Enabled": "Enable trim replay",
   "ResetAfterSave": "Prevent overlap between clips",

@@ -49,7 +49,6 @@ ffi.cdef[[
 ]]
 
 local kernel32 = ffi.load("kernel32")
-
 local CREATE_NO_WINDOW = 0x08000000
 local STARTF_USESTDHANDLES = 0x00000100
 local STILL_ACTIVE = 259
@@ -72,6 +71,7 @@ local use_resolution = false
 local fps_value = 60
 local use_fps = false
 local ffmpeg_exe = ""
+local ffmpeg_autodetect_done = false
 local global_settings = nil
 local available_hwaccels = {}
 local hwaccels_detected = false
@@ -103,6 +103,51 @@ end
 function script_description()
     init_locale()
     return getString("ScriptDescription")
+end
+
+local function basename(p)
+    return p and p:match("[^/\\]+$") or ""
+end
+
+local function is_tool_name(path, name)
+    return basename(path):lower() == name:lower()
+end
+
+local function file_exists(name)
+    if not name or name == "" then return false end
+    local f = io.open(name, "r")
+    if f ~= nil then io.close(f); return true end
+    return false
+end
+
+local function find_in_path(exe_name)
+    local env = os.getenv("PATH")
+    if not env then return nil end
+    for dir in env:gmatch("[^;]+") do
+        dir = dir:gsub("^%s+", ""):gsub("%s+$", "")
+        if dir ~= "" then
+            local candidate = dir .. "\\" .. exe_name
+            local f = io.open(candidate, "r")
+            if f then f:close(); return candidate end
+        end
+    end
+    return nil
+end
+
+local function find_next_to_script(exe_name)
+    local d = script_path():match("(.*[/\\])") or ""
+    local candidate = d .. exe_name
+    local f = io.open(candidate, "r")
+    if f then f:close(); return candidate end
+    return nil
+end
+
+local function autodetect_exe(exe_name)
+    return find_in_path(exe_name) or find_next_to_script(exe_name)
+end
+
+local function valid_tool_path(path, expected_name)
+    return path and path ~= "" and is_tool_name(path, expected_name) and file_exists(path)
 end
 
 local function ensure_nul_handle()
@@ -266,36 +311,14 @@ local function start_compression(in_path, crf, hw_enabled, res_enabled, res_heig
         end
     end
     attempts[#attempts + 1] = "__software__"
-    comp_state = {
-        input_path = in_path,
-        output_path = out_path,
-        crf = crf,
-        res_enabled = res_enabled,
-        res_height = res_height,
-        fps_enabled = fps_enabled,
-        fps_rate = fps_rate,
-        attempts = attempts,
-        attempt_index = 0,
-        current_label = nil,
-        process_handle = nil,
-        pid = nil
-    }
+    comp_state = {input_path = in_path, output_path = out_path, crf = crf, res_enabled = res_enabled, res_height = res_height, fps_enabled = fps_enabled, fps_rate = fps_rate, attempts = attempts, attempt_index = 0, current_label = nil, process_handle = nil, pid = nil}
     launch_attempt(1)
     return true
 end
 
-local function file_exists(name)
-    local f = io.open(name, "r")
-    if f ~= nil then
-        io.close(f)
-        return true
-    end
-    return false
-end
-
 local function compress_file()
     if input_file == "" or input_file == nil then return false end
-    if not file_exists(ffmpeg_exe) then return false end
+    if not valid_tool_path(ffmpeg_exe, "ffmpeg.exe") then return false end
     if comp_state then return false end
     if use_hw_accel then
         detect_hwaccels()
@@ -326,9 +349,8 @@ end
 
 function script_load(settings)
     init_locale()
-    local script_dir = script_path():match("(.*[/\\])") or ""
-    ffmpeg_exe = script_dir .. "ffmpeg.exe"
     if settings then
+        ffmpeg_exe = obs.obs_data_get_string(settings, "ffmpeg_path") or ""
         input_file = obs.obs_data_get_string(settings, "input_file") or ""
         if obs.obs_data_has_user_value(settings, "crf_value") then
             crf_value = obs.obs_data_get_int(settings, "crf_value")
@@ -346,6 +368,7 @@ function script_load(settings)
 end
 
 function script_save(settings)
+    obs.obs_data_set_string(settings, "ffmpeg_path", ffmpeg_exe or "")
     obs.obs_data_set_bool(settings, "use_hw_accel", use_hw_accel)
     obs.obs_data_set_int(settings, "crf_value", crf_value)
     obs.obs_data_set_bool(settings, "use_resolution", use_resolution)
@@ -361,6 +384,17 @@ function script_update(settings)
         obs.obs_data_release(global_settings)
     end
     global_settings = settings
+    ffmpeg_exe = obs.obs_data_get_string(settings, "ffmpeg_path") or ""
+    if not ffmpeg_autodetect_done then
+        ffmpeg_autodetect_done = true
+        if ffmpeg_exe == "" and not obs.obs_data_has_user_value(settings, "ffmpeg_path") then
+            local found = autodetect_exe("ffmpeg.exe")
+            if found then
+                ffmpeg_exe = found
+                obs.obs_data_set_string(settings, "ffmpeg_path", found)
+            end
+        end
+    end
     input_file = obs.obs_data_get_string(settings, "input_file")
     if obs.obs_data_has_user_value(settings, "crf_value") then
         crf_value = obs.obs_data_get_int(settings, "crf_value")
@@ -402,9 +436,12 @@ function script_properties()
     init_locale()
     local props = obs.obs_properties_create()
     obs.obs_properties_add_text(props, "script_description_text", getString("ScriptDescription"), obs.OBS_TEXT_INFO)
+    local g_ffmpeg = obs.obs_properties_create()
+    obs.obs_properties_add_path(g_ffmpeg, "ffmpeg_path", getString("FFmpegPath"), obs.OBS_PATH_FILE, "Executable files (*.exe);;All files (*.*)", nil)
+    obs.obs_properties_add_group(props, "group_ffmpeg", getString("GroupFFmpeg"), obs.OBS_GROUP_NORMAL, g_ffmpeg)
     local g_compress = obs.obs_properties_create()
     obs.obs_properties_add_path(g_compress, "input_file", getString("InputFile"), obs.OBS_PATH_FILE, getString("VideoFilesFilter"), nil)
-	obs.obs_properties_add_bool(g_compress, "use_hw_accel", getString("UseHWDecoding"))
+    obs.obs_properties_add_bool(g_compress, "use_hw_accel", getString("UseHWDecoding"))
     obs.obs_properties_add_int_slider(g_compress, "crf_value", getString("CRFValue"), 1, 51, 1)
     local res_list = obs.obs_properties_add_list(g_compress, "resolution_value", getString("Resolution"), obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_INT)
     obs.obs_property_list_add_int(res_list, "144p", 144)

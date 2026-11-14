@@ -1,5 +1,8 @@
 {
   "ScriptDescription": " ",
+  "GroupFFmpeg": "FFmpeg",
+  "FFmpegPath": "Путь FFmpeg",
+  "FFprobePath": "Путь FFprobe",
   "GroupControl": "Управление обрезкой повтора",
   "Enabled": "Включить обрезку повтора",
   "ResetAfterSave": "Не допускать наложения клипов",

@@ -2,5 +2,6 @@
   "ScriptDescription": " ",
   "GroupManagement": "Управление организацией файлов",
   "EnableSorting": "Включить сортировку",
-  "AutoSplit": "Авторазделение записи при смене фокуса"
+  "AutoSplit": "Авторазделение записи при смене фокуса",
+  "DesktopFolderName": "Рабочий стол"
 }
