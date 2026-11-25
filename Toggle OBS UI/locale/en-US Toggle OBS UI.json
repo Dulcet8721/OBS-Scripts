@@ -2,5 +2,6 @@
   "ScriptDescription": " ",
   "GroupHotkeys": "OBS UI toggle hotkey settings",
   "ScriptWindowEnabled": "Open «Scripts» window along with OBS UI",
+  "ScriptsWindowTitles": "Scripts",
   "HotkeyToggleOBSUI": "Toggle OBS UI"
 }

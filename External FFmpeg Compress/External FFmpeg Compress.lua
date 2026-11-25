@@ -8,11 +8,12 @@ ffi.cdef[[
     typedef unsigned int UINT;
     typedef unsigned short WORD;
     typedef unsigned char BYTE;
-    typedef struct _STARTUPINFOA {
+    typedef unsigned short wchar_t;
+    typedef struct _STARTUPINFOW {
         DWORD cb;
-        char* lpReserved;
-        char* lpDesktop;
-        char* lpTitle;
+        wchar_t* lpReserved;
+        wchar_t* lpDesktop;
+        wchar_t* lpTitle;
         DWORD dwX;
         DWORD dwY;
         DWORD dwXSize;
@@ -27,7 +28,7 @@ ffi.cdef[[
         HANDLE hStdInput;
         HANDLE hStdOutput;
         HANDLE hStdError;
-    } STARTUPINFOA;
+    } STARTUPINFOW;
     typedef struct _PROCESS_INFORMATION {
         HANDLE hProcess;
         HANDLE hThread;
@@ -40,12 +41,20 @@ ffi.cdef[[
         BOOL bInheritHandle;
     } SECURITY_ATTRIBUTES;
     HANDLE CreateFileA(const char* lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, void* lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
-    BOOL CreateProcessA(const char* lpApplicationName, char* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, void* lpEnvironment, const char* lpCurrentDirectory, STARTUPINFOA* lpStartupInfo, PROCESS_INFORMATION* lpProcessInformation);
+    int MultiByteToWideChar(unsigned int CodePage, DWORD dwFlags, const char* lpMultiByteStr, int cbMultiByte, wchar_t* lpWideCharStr, int cchWideChar);
+    typedef struct _FILETIME { DWORD dwLowDateTime; DWORD dwHighDateTime; } FILETIME;
+    typedef struct _WIN32_FILE_ATTRIBUTE_DATA { DWORD dwFileAttributes; FILETIME ftCreationTime; FILETIME ftLastAccessTime; FILETIME ftLastWriteTime; DWORD nFileSizeHigh; DWORD nFileSizeLow; } WIN32_FILE_ATTRIBUTE_DATA;
+    BOOL GetFileAttributesExW(const wchar_t* lpFileName, int fInfoLevelId, void* lpFileInformation);
+    BOOL CreateProcessW(const wchar_t* lpApplicationName, wchar_t* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, void* lpEnvironment, const wchar_t* lpCurrentDirectory, STARTUPINFOW* lpStartupInfo, PROCESS_INFORMATION* lpProcessInformation);
     DWORD GetExitCodeProcess(HANDLE hProcess, DWORD* lpExitCode);
     DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
     BOOL TerminateProcess(HANDLE hProcess, UINT uExitCode);
     DWORD GetLastError(void);
-    BOOL CloseHandle(HANDLE hObject);
+    BOOL CloseHandle(HANDLE);
+    typedef size_t SIZE_T;
+    HANDLE CreateFileMappingW(HANDLE, void*, DWORD, DWORD, DWORD, const wchar_t*);
+    void* MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
+    BOOL UnmapViewOfFile(void*);
 ]]
 
 local kernel32 = ffi.load("kernel32")
@@ -58,6 +67,25 @@ local FILE_SHARE_READ = 0x00000001
 local FILE_SHARE_WRITE = 0x00000002
 local OPEN_EXISTING = 3
 local NULL_HANDLE = ffi.cast("HANDLE", 0)
+
+local function utf8_to_wide(s)
+    if not s or s == "" then return nil end
+    local len = kernel32.MultiByteToWideChar(65001, 0, s, -1, nil, 0)
+    if not len or len <= 0 then return nil end
+    local buf = ffi.new("wchar_t[?]", len)
+    if kernel32.MultiByteToWideChar(65001, 0, s, -1, buf, len) == 0 then return nil end
+    return buf
+end
+
+local function wide_stat(path)
+    if not path or path == "" then return nil end
+    local w = utf8_to_wide(path)
+    if not w then return nil end
+    local dat = ffi.new("WIN32_FILE_ATTRIBUTE_DATA[1]")
+    if kernel32.GetFileAttributesExW(w, 0, dat) == 0 then return nil end
+    return dat
+end
+
 local INVALID_HANDLE_VALUE = ffi.cast("HANDLE", -1)
 local LOCALE_BASENAME = "External FFmpeg Compress"
 local hwaccel_priority = { "cuda", "qsv", "d3d11va", "dxva2" }
@@ -70,6 +98,7 @@ local resolution_value = 1080
 local use_resolution = false
 local fps_value = 60
 local use_fps = false
+local open_in_explorer = true
 local ffmpeg_exe = ""
 local ffmpeg_autodetect_done = false
 local global_settings = nil
@@ -77,6 +106,14 @@ local available_hwaccels = {}
 local hwaccels_detected = false
 local nul_handle = nil
 local comp_state = nil
+
+local EFC_NOTIFY_NAME = "Local\\OBS_EFC_Notify_v1"
+local EFC_NOTIFY_HEADER = 8
+local EFC_NOTIFY_SLOT = 1024
+local EFC_NOTIFY_SLOTS = 128
+local EFC_NOTIFY_TOTAL = EFC_NOTIFY_HEADER + EFC_NOTIFY_SLOT * EFC_NOTIFY_SLOTS
+local EFC_NOTIFY_PAYLOAD_MAX = EFC_NOTIFY_SLOT - 8
+local efc_notify_handle, efc_notify_view, efc_notify_hdr = nil, nil, nil
 
 local function is_valid_handle(h)
     return h ~= nil and h ~= NULL_HANDLE and h ~= INVALID_HANDLE_VALUE
@@ -114,10 +151,7 @@ local function is_tool_name(path, name)
 end
 
 local function file_exists(name)
-    if not name or name == "" then return false end
-    local f = io.open(name, "r")
-    if f ~= nil then io.close(f); return true end
-    return false
+    return wide_stat(name) ~= nil
 end
 
 local function find_in_path(exe_name)
@@ -127,8 +161,7 @@ local function find_in_path(exe_name)
         dir = dir:gsub("^%s+", ""):gsub("%s+$", "")
         if dir ~= "" then
             local candidate = dir .. "\\" .. exe_name
-            local f = io.open(candidate, "r")
-            if f then f:close(); return candidate end
+            if file_exists(candidate) then return candidate end
         end
     end
     return nil
@@ -137,8 +170,7 @@ end
 local function find_next_to_script(exe_name)
     local d = script_path():match("(.*[/\\])") or ""
     local candidate = d .. exe_name
-    local f = io.open(candidate, "r")
-    if f then f:close(); return candidate end
+    if file_exists(candidate) then return candidate end
     return nil
 end
 
@@ -171,19 +203,21 @@ local function spawn_hidden(cmdline)
         return nil, nil, "empty cmdline"
     end
     ensure_nul_handle()
-    local si = ffi.new("STARTUPINFOA[1]")
-    si[0].cb = ffi.sizeof("STARTUPINFOA")
+    local wcmd = utf8_to_wide(cmdline)
+    if not wcmd then
+        return nil, nil, "utf8 conversion failed"
+    end
+    local si = ffi.new("STARTUPINFOW[1]")
+    si[0].cb = ffi.sizeof("STARTUPINFOW")
     if nul_handle ~= nil then
         si[0].dwFlags = STARTF_USESTDHANDLES
         si[0].hStdInput = nul_handle
         si[0].hStdOutput = nul_handle
         si[0].hStdError = nul_handle
     end
-    local buf = ffi.new("char[?]", #cmdline + 1)
-    ffi.copy(buf, cmdline)
     local pi = ffi.new("PROCESS_INFORMATION[1]")
     local inherit = (nul_handle ~= nil) and 1 or 0
-    local ok = kernel32.CreateProcessA(nil, buf, nil, nil, inherit, CREATE_NO_WINDOW, nil, nil, si, pi)
+    local ok = kernel32.CreateProcessW(nil, wcmd, nil, nil, inherit, CREATE_NO_WINDOW, nil, nil, si, pi)
     if ok == 0 then
         return nil, nil, kernel32.GetLastError()
     end
@@ -260,15 +294,57 @@ local function build_ffmpeg_cmd(in_path, out_path, crf, hwaccel, res_enabled, re
     return string.format('"%s" -y%s -i "%s"%s%s -c:v libx264 -crf %d -preset veryfast -pix_fmt yuv420p -x264-params "bframes=2" -movflags +faststart -c:a copy "%s"', clean_ffmpeg, decoder_arg, clean_input, vf_arg, fps_arg, crf, clean_output)
 end
 
+local function efc_notify_open()
+    if efc_notify_view then return true end
+    efc_notify_handle = kernel32.CreateFileMappingW(ffi.cast("HANDLE", -1), nil, 0x04, 0, EFC_NOTIFY_TOTAL, utf8_to_wide(EFC_NOTIFY_NAME))
+    if efc_notify_handle == nil or efc_notify_handle == ffi.cast("HANDLE", 0) then
+        efc_notify_handle = nil
+        return false
+    end
+    efc_notify_view = kernel32.MapViewOfFile(efc_notify_handle, 0x000F001F, 0, 0, EFC_NOTIFY_TOTAL)
+    if efc_notify_view == nil then
+        kernel32.CloseHandle(efc_notify_handle)
+        efc_notify_handle = nil
+        return false
+    end
+    efc_notify_hdr = ffi.cast("unsigned int*", efc_notify_view)
+    return true
+end
+
+local function efc_notify_close()
+    if efc_notify_view then kernel32.UnmapViewOfFile(efc_notify_view); efc_notify_view = nil end
+    if efc_notify_handle then kernel32.CloseHandle(efc_notify_handle); efc_notify_handle = nil end
+    efc_notify_hdr = nil
+end
+
+local function efc_notify_write(path)
+    if not efc_notify_view or not efc_notify_hdr then
+        if not efc_notify_open() then return end
+    end
+    path = tostring(path or "")
+    local plen = #path
+    if plen == 0 or plen > EFC_NOTIFY_PAYLOAD_MAX then return end
+    local ws = efc_notify_hdr[0]
+    local idx = ws % EFC_NOTIFY_SLOTS
+    local slot = ffi.cast("unsigned char*", efc_notify_view) + EFC_NOTIFY_HEADER + idx * EFC_NOTIFY_SLOT
+    ffi.cast("unsigned int*", slot)[0] = 0
+    ffi.cast("unsigned int*", slot + 4)[0] = plen
+    ffi.copy(slot + 8, path, plen)
+    efc_notify_hdr[0] = ws + 1
+end
+
 local function finalize_compression_success()
     local st = comp_state
     comp_state = nil
+    efc_notify_write(st.output_path)
+    if not open_in_explorer then return end
     local clean = st.output_path:gsub("/", "\\")
     local h = spawn_hidden('explorer.exe /select,"' .. clean .. '"')
     if h then kernel32.CloseHandle(h) end
 end
 
 local function finalize_compression_failure()
+    print("[External FFmpeg Compress] all ffmpeg attempts failed for: " .. tostring(comp_state and comp_state.output_path or "?"))
     comp_state = nil
 end
 
@@ -284,8 +360,9 @@ local function launch_attempt(index)
     comp_state.attempt_index = index
     comp_state.current_label = hwaccel or "software"
     local cmd = build_ffmpeg_cmd(comp_state.input_path, comp_state.output_path, comp_state.crf, hwaccel, comp_state.res_enabled, comp_state.res_height, comp_state.fps_enabled, comp_state.fps_rate)
-    local h, pid = spawn_hidden(cmd)
+    local h, pid, err = spawn_hidden(cmd)
     if not h then
+        print("[External FFmpeg Compress] spawn failed (" .. tostring(hwaccel or "software") .. "): " .. tostring(err))
         launch_attempt(index + 1)
         return
     end
@@ -296,9 +373,10 @@ end
 local function start_compression(in_path, crf, hw_enabled, res_enabled, res_height, fps_enabled, fps_rate)
     if comp_state then return false end
     if in_path == nil or in_path == "" then return false end
-    local f = io.open(in_path, "r")
-    if not f then return false end
-    io.close(f)
+    if not file_exists(in_path) then
+        print("[External FFmpeg Compress] input file not found: " .. tostring(in_path))
+        return false
+    end
     local dir, filename = in_path:match("^(.*[/\\])(.-)$")
     if not dir then dir = ""; filename = in_path end
     local out_path = dir .. "Compressed " .. filename
@@ -364,7 +442,9 @@ function script_load(settings)
             fps_value = obs.obs_data_get_int(settings, "fps_value")
         end
         use_fps = obs.obs_data_get_bool(settings, "use_fps")
+        open_in_explorer = obs.obs_data_get_bool(settings, "open_in_explorer")
     end
+    pcall(efc_notify_open)
 end
 
 function script_save(settings)
@@ -375,6 +455,7 @@ function script_save(settings)
     obs.obs_data_set_int(settings, "resolution_value", resolution_value)
     obs.obs_data_set_bool(settings, "use_fps", use_fps)
     obs.obs_data_set_int(settings, "fps_value", fps_value)
+    obs.obs_data_set_bool(settings, "open_in_explorer", open_in_explorer)
 end
 
 function script_update(settings)
@@ -408,6 +489,7 @@ function script_update(settings)
         fps_value = obs.obs_data_get_int(settings, "fps_value")
     end
     use_fps = obs.obs_data_get_bool(settings, "use_fps")
+    open_in_explorer = obs.obs_data_get_bool(settings, "open_in_explorer")
 end
 
 function script_defaults(settings)
@@ -417,6 +499,7 @@ function script_defaults(settings)
     obs.obs_data_set_default_bool(settings, "use_resolution", false)
     obs.obs_data_set_default_int(settings, "fps_value", 60)
     obs.obs_data_set_default_bool(settings, "use_fps", false)
+    obs.obs_data_set_default_bool(settings, "open_in_explorer", true)
 end
 
 function script_unload()
@@ -425,6 +508,7 @@ function script_unload()
         pcall(close_process, comp_state.process_handle)
     end
     comp_state = nil
+    pcall(efc_notify_close)
     if is_valid_handle(nul_handle) then pcall(kernel32.CloseHandle, nul_handle) end
     nul_handle = nil
     if global_settings then pcall(obs.obs_data_release, global_settings); global_settings = nil end
@@ -453,8 +537,9 @@ function script_properties()
     obs.obs_property_list_add_int(res_list, "1440p", 1440)
     obs.obs_property_list_add_int(res_list, "2160p", 2160)
     obs.obs_properties_add_bool(g_compress, "use_resolution", getString("UseResolution"))
-    obs.obs_properties_add_int_slider(g_compress, "fps_value", getString("FPSValue"), 30, 60, 1)
+    obs.obs_properties_add_int_slider(g_compress, "fps_value", getString("FPSValue"), 10, 60, 1)
     obs.obs_properties_add_bool(g_compress, "use_fps", getString("UseFPS"))
+    obs.obs_properties_add_bool(g_compress, "open_in_explorer", getString("OpenInExplorer"))
     obs.obs_properties_add_button(g_compress, "compress_button", getString("CompressButton"), function(properties, property) return compress_file() end)
     obs.obs_properties_add_group(props, "group_compress", getString("GroupCompress"), obs.OBS_GROUP_NORMAL, g_compress)
     return props

@@ -44,8 +44,8 @@ local VK_RETURN = 0x0D
 local KEYEVENTF_KEYUP = 0x0002
 local WM_CLOSE = 0x0010
 local CP_UTF8 = 65001
-local SCRIPTS_RU = "Скрипты"
-local SCRIPTS_EN = "Scripts"
+local SCRIPTS_TITLES_KEY = "ScriptsWindowTitles"
+local SCRIPTS_TITLES_FALLBACK = "Scripts"
 local NULL_HWND = ffi.cast("HWND", 0)
 local LOCALE_BASENAME = "Toggle OBS UI"
 local default_loc = nil
@@ -85,6 +85,9 @@ local function getString(key)
     return (str ~= "") and str or key
 end
 
+local scripts_titles = {}
+local scripts_titles_loaded = false
+
 local function init_locale()
     if default_loc then return end
     local dir = script_path():match("(.*[/\\])") or ""
@@ -93,6 +96,24 @@ local function init_locale()
     default_loc = obs.obs_data_create_from_json_file(loc_dir .. "en-US " .. LOCALE_BASENAME .. ".json")
     current_loc = obs.obs_data_create_from_json_file(loc_dir .. lang .. " " .. LOCALE_BASENAME .. ".json")
         or obs.obs_data_create_from_json_file(loc_dir .. lang:sub(1, 2) .. " " .. LOCALE_BASENAME .. ".json")
+end
+
+local function update_scripts_titles()
+    init_locale()
+    scripts_titles = {}
+    local raw = getString(SCRIPTS_TITLES_KEY)
+    if raw ~= SCRIPTS_TITLES_KEY then
+        for name in raw:gmatch("[^,]+") do
+            local trimmed = name:match("^%s*(.-)%s*$")
+            if trimmed and trimmed ~= "" then
+                scripts_titles[#scripts_titles + 1] = trimmed
+            end
+        end
+    end
+    if #scripts_titles == 0 then
+        scripts_titles[1] = SCRIPTS_TITLES_FALLBACK
+    end
+    scripts_titles_loaded = true
 end
 
 function script_description()
@@ -145,6 +166,7 @@ end
 
 local function find_scripts_window(obs_hwnd)
     if not is_valid_hwnd(obs_hwnd) then return nil end
+    if not scripts_titles_loaded then update_scripts_titles() end
     local pid = ffi.new("DWORD[1]")
     user32.GetWindowThreadProcessId(obs_hwnd, pid)
     if pid[0] == 0 then return nil end
@@ -155,9 +177,11 @@ local function find_scripts_window(obs_hwnd)
         if wnd_pid[0] ~= pid[0] then return true end
         local title = get_window_title_utf8(hwnd)
         if not title then return true end
-        if title:find(SCRIPTS_RU, 1, true) or title:find(SCRIPTS_EN, 1, true) then
-            found[0] = hwnd
-            return false
+        for _, t in ipairs(scripts_titles) do
+            if title:find(t, 1, true) then
+                found[0] = hwnd
+                return false
+            end
         end
         return true
     end)
@@ -213,6 +237,7 @@ end
 
 function script_load(settings)
     init_locale()
+    update_scripts_titles()
     if settings then
         script_window_enabled = obs.obs_data_get_bool(settings, "script_window_enabled")
     end
@@ -238,6 +263,7 @@ end
 function script_update(settings)
     if not settings then return end
     script_window_enabled = obs.obs_data_get_bool(settings, "script_window_enabled")
+    update_scripts_titles()
 end
 
 function script_defaults(settings)

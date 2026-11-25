@@ -8,20 +8,21 @@ ffi.cdef[[
     typedef unsigned int UINT;
     typedef unsigned short WORD;
     typedef unsigned char BYTE;
+    typedef unsigned short wchar_t;
     typedef const unsigned short* LPCWSTR;
     typedef size_t SIZE_T;
-    typedef struct _STARTUPINFOA {
+    typedef struct _STARTUPINFOW {
         DWORD cb;
-        char* lpReserved;
-        char* lpDesktop;
-        char* lpTitle;
+        wchar_t* lpReserved;
+        wchar_t* lpDesktop;
+        wchar_t* lpTitle;
         DWORD dwX; DWORD dwY; DWORD dwXSize; DWORD dwYSize;
         DWORD dwXCountChars; DWORD dwYCountChars; DWORD dwFillAttribute;
         DWORD dwFlags;
         WORD wShowWindow; WORD cbReserved2;
         BYTE* lpReserved2;
         HANDLE hStdInput; HANDLE hStdOutput; HANDLE hStdError;
-    } STARTUPINFOA;
+    } STARTUPINFOW;
     typedef struct _PROCESS_INFORMATION {
         HANDLE hProcess; HANDLE hThread;
         DWORD dwProcessId; DWORD dwThreadId;
@@ -30,7 +31,13 @@ ffi.cdef[[
         DWORD nLength; void* lpSecurityDescriptor; BOOL bInheritHandle;
     } SECURITY_ATTRIBUTES;
     HANDLE CreateFileA(const char* lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, void* lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
-    BOOL CreateProcessA(const char* lpApplicationName, char* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, void* lpEnvironment, const char* lpCurrentDirectory, STARTUPINFOA* lpStartupInfo, PROCESS_INFORMATION* lpProcessInformation);
+    BOOL CreateProcessW(const wchar_t* lpApplicationName, wchar_t* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, void* lpEnvironment, const wchar_t* lpCurrentDirectory, STARTUPINFOW* lpStartupInfo, PROCESS_INFORMATION* lpProcessInformation);
+    int MultiByteToWideChar(unsigned int CodePage, DWORD dwFlags, const char* lpMultiByteStr, int cbMultiByte, wchar_t* lpWideCharStr, int cchWideChar);
+    typedef struct _FILETIME { DWORD dwLowDateTime; DWORD dwHighDateTime; } FILETIME;
+    typedef struct _WIN32_FILE_ATTRIBUTE_DATA { DWORD dwFileAttributes; FILETIME ftCreationTime; FILETIME ftLastAccessTime; FILETIME ftLastWriteTime; DWORD nFileSizeHigh; DWORD nFileSizeLow; } WIN32_FILE_ATTRIBUTE_DATA;
+    BOOL GetFileAttributesExW(LPCWSTR lpFileName, int fInfoLevelId, void* lpFileInformation);
+    BOOL MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags);
+    BOOL DeleteFileW(LPCWSTR lpFileName);
     BOOL CreatePipe(HANDLE* hReadPipe, HANDLE* hWritePipe, SECURITY_ATTRIBUTES* lpPipeAttributes, DWORD nSize);
     BOOL PeekNamedPipe(HANDLE hNamedPipe, void* lpBuffer, DWORD nBufferSize, DWORD* lpBytesRead, DWORD* lpTotalBytesAvail, DWORD* lpBytesLeftThisMessage);
     BOOL ReadFile(HANDLE hFile, void* lpBuffer, DWORD nNumberOfBytesToRead, DWORD* lpNumberOfBytesRead, void* lpOverlapped);
@@ -54,6 +61,25 @@ local FILE_SHARE_WRITE = 0x00000002
 local OPEN_EXISTING = 3
 local NULL_HANDLE = ffi.cast("HANDLE", 0)
 local INVALID_HANDLE_VALUE = ffi.cast("HANDLE", -1)
+
+local function utf8_to_wide(s)
+    if not s or s == "" then return nil end
+    local len = kernel32.MultiByteToWideChar(65001, 0, s, -1, nil, 0)
+    if not len or len <= 0 then return nil end
+    local buf = ffi.new("wchar_t[?]", len)
+    if kernel32.MultiByteToWideChar(65001, 0, s, -1, buf, len) == 0 then return nil end
+    return buf
+end
+
+local function wide_stat(path)
+    if not path or path == "" then return nil end
+    local w = utf8_to_wide(path)
+    if not w then return nil end
+    local dat = ffi.new("WIN32_FILE_ATTRIBUTE_DATA[1]")
+    if kernel32.GetFileAttributesExW(w, 0, dat) == 0 then return nil end
+    return dat
+end
+
 local LOCALE_NAME = "Trim Replay"
 local DEFAULT_DURATIONS = { 30, 60, 120 }
 local UI_MAX_SECONDS = 3600
@@ -129,10 +155,7 @@ local function now_ms()
 end
 
 local function file_exists(path)
-    if not path or path == "" then return false end
-    local f = io.open(path, "r")
-    if f then f:close(); return true end
-    return false
+    return wide_stat(path) ~= nil
 end
 
 local function basename(p)
@@ -150,8 +173,7 @@ local function find_in_path(exe_name)
         dir = dir:gsub("^%s+", ""):gsub("%s+$", "")
         if dir ~= "" then
             local candidate = dir .. "\\" .. exe_name
-            local f = io.open(candidate, "r")
-            if f then f:close(); return candidate end
+            if file_exists(candidate) then return candidate end
         end
     end
     return nil
@@ -160,8 +182,7 @@ end
 local function find_next_to_script(exe_name)
     local d = script_path():match("(.*[/\\])") or ""
     local candidate = d .. exe_name
-    local f = io.open(candidate, "r")
-    if f then f:close(); return candidate end
+    if file_exists(candidate) then return candidate end
     return nil
 end
 
@@ -174,16 +195,16 @@ local function valid_tool_path(path, expected_name)
 end
 
 local function get_file_size(path)
-    if not path or path == "" then return nil end
-    local f = io.open(path, "rb")
-    if not f then return nil end
-    local s = f:seek("end")
-    f:close()
-    return s
+    local dat = wide_stat(path)
+    if not dat then return nil end
+    return tonumber(dat[0].nFileSizeHigh) * 4294967296 + tonumber(dat[0].nFileSizeLow)
 end
 
 local function delete_file(path)
-    if path and path ~= "" then os.remove(path) end
+    if not path or path == "" then return end
+    local w = utf8_to_wide(path)
+    if not w then return end
+    kernel32.DeleteFileW(w)
 end
 
 local function get_last_replay_path(output)
@@ -365,19 +386,19 @@ end
 local function spawn_hidden(cmdline)
     if not cmdline or #cmdline == 0 then return nil end
     ensure_nul_handle()
-    local si = ffi.new("STARTUPINFOA[1]")
-    si[0].cb = ffi.sizeof("STARTUPINFOA")
+    local wcmd = utf8_to_wide(cmdline)
+    if not wcmd then return nil end
+    local si = ffi.new("STARTUPINFOW[1]")
+    si[0].cb = ffi.sizeof("STARTUPINFOW")
     if nul_handle ~= nil then
         si[0].dwFlags = STARTF_USESTDHANDLES
         si[0].hStdInput  = nul_handle
         si[0].hStdOutput = nul_handle
         si[0].hStdError  = nul_handle
     end
-    local buf = ffi.new("char[?]", #cmdline + 1)
-    ffi.copy(buf, cmdline)
     local pi = ffi.new("PROCESS_INFORMATION[1]")
     local inherit = (nul_handle ~= nil) and 1 or 0
-    local ok = kernel32.CreateProcessA(nil, buf, nil, nil, inherit, CREATE_NO_WINDOW, nil, nil, si, pi)
+    local ok = kernel32.CreateProcessW(nil, wcmd, nil, nil, inherit, CREATE_NO_WINDOW, nil, nil, si, pi)
     if ok == 0 then return nil end
     kernel32.CloseHandle(pi[0].hThread)
     return pi[0].hProcess
@@ -386,6 +407,8 @@ end
 local function spawn_with_pipe(cmdline)
     if not cmdline or #cmdline == 0 then return nil end
     ensure_nul_handle()
+    local wcmd = utf8_to_wide(cmdline)
+    if not wcmd then return nil end
     local sa = ffi.new("SECURITY_ATTRIBUTES[1]")
     sa[0].nLength = ffi.sizeof("SECURITY_ATTRIBUTES")
     sa[0].lpSecurityDescriptor = nil
@@ -393,16 +416,14 @@ local function spawn_with_pipe(cmdline)
     local rh = ffi.new("HANDLE[1]")
     local wh = ffi.new("HANDLE[1]")
     if kernel32.CreatePipe(rh, wh, sa, 0) == 0 then return nil end
-    local si = ffi.new("STARTUPINFOA[1]")
-    si[0].cb = ffi.sizeof("STARTUPINFOA")
+    local si = ffi.new("STARTUPINFOW[1]")
+    si[0].cb = ffi.sizeof("STARTUPINFOW")
     si[0].dwFlags = STARTF_USESTDHANDLES
-    si[0].hStdInput  = nul_handle or INVALID_HANDLE_VALUE
+    si[0].hStdInput  = nul_handle or NULL_HANDLE
     si[0].hStdOutput = wh[0]
     si[0].hStdError  = wh[0]
-    local buf = ffi.new("char[?]", #cmdline + 1)
-    ffi.copy(buf, cmdline)
     local pi = ffi.new("PROCESS_INFORMATION[1]")
-    local ok = kernel32.CreateProcessA(nil, buf, nil, nil, 1, CREATE_NO_WINDOW, nil, nil, si, pi)
+    local ok = kernel32.CreateProcessW(nil, wcmd, nil, nil, 1, CREATE_NO_WINDOW, nil, nil, si, pi)
     kernel32.CloseHandle(wh[0])
     if ok == 0 then
         kernel32.CloseHandle(rh[0])
@@ -691,7 +712,8 @@ local function finish_trim_job(job, success)
                 final_path = job.path
             else
                 delete_file(job.path)
-                local ok = os.rename(job.output_path, job.path)
+                local ws, wd = utf8_to_wide(job.output_path), utf8_to_wide(job.path)
+                local ok = ws and wd and kernel32.MoveFileExW(ws, wd, 1) ~= 0
                 if ok and file_exists(job.path) then
                     final_path = job.path
                 else
@@ -735,13 +757,7 @@ local function tick_active_job()
     close_process(job.stage_proc)
     job.stage_proc = nil
     if status ~= "ok" then
-        if job.phase == "probe_duration" then
-            handle_probe_duration_done(job)
-        elseif job.phase == "probe_keyframes" then
-            handle_probe_keyframes_done(job)
-        elseif job.phase == "ffmpeg" then
-            job.phase = "failed"
-        end
+        job.phase = "failed"
         return
     end
     if job.phase == "probe_duration" then

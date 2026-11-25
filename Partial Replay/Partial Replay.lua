@@ -8,8 +8,10 @@ local SYNC_TOLERANCE_MS = 100
 local SAFETY_TIMEOUT_MS = 30000
 local START_RETRY_AFTER_MS = 3000
 local START_MAX_ATTEMPTS = 2
-local FILE_STABLE_TICKS = 5
 local FINALIZE_TIMEOUT_MS = 15000
+local GENERIC_READ = 0x80000000
+local OPEN_EXISTING = 3
+local FILE_ATTRIBUTE_NORMAL = 0x80
 local default_loc = nil
 local current_loc = nil
 local enabled = false
@@ -68,8 +70,14 @@ ffi.cdef[[
     typedef void* HANDLE;
     typedef unsigned long DWORD;
     typedef int BOOL;
+    typedef unsigned short wchar_t;
     typedef const unsigned short* LPCWSTR;
     typedef size_t SIZE_T;
+    typedef struct _FILETIME { DWORD dwLowDateTime; DWORD dwHighDateTime; } FILETIME;
+    typedef struct _WIN32_FILE_ATTRIBUTE_DATA { DWORD dwFileAttributes; FILETIME ftCreationTime; FILETIME ftLastAccessTime; FILETIME ftLastWriteTime; DWORD nFileSizeHigh; DWORD nFileSizeLow; } WIN32_FILE_ATTRIBUTE_DATA;
+    int MultiByteToWideChar(unsigned int CodePage, DWORD dwFlags, const char* lpMultiByteStr, int cbMultiByte, wchar_t* lpWideCharStr, int cchWideChar);
+    BOOL GetFileAttributesExW(LPCWSTR lpFileName, int fInfoLevelId, void* lpFileInformation);
+    HANDLE CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, void* lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
     HANDLE CreateFileMappingW(HANDLE, void*, DWORD, DWORD, DWORD, LPCWSTR);
     HANDLE OpenFileMappingW(DWORD, BOOL, LPCWSTR);
     void* MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
@@ -87,6 +95,15 @@ local function bridge_wide(s)
     for i = 1, #s do b[i-1] = s:byte(i) end
     b[#s] = 0
     return b
+end
+
+local function utf8_to_wide(s)
+    if not s or s == "" then return nil end
+    local len = kernel32.MultiByteToWideChar(65001, 0, s, -1, nil, 0)
+    if not len or len <= 0 then return nil end
+    local buf = ffi.new("wchar_t[?]", len)
+    if kernel32.MultiByteToWideChar(65001, 0, s, -1, buf, len) == 0 then return nil end
+    return buf
 end
 
 local function bridge_open()
@@ -220,11 +237,23 @@ end
 
 local function get_file_size(path)
     if not path or path == "" then return nil end
-    local f = io.open(path, "rb")
-    if not f then return nil end
-    local size = f:seek("end")
-    f:close()
-    return size
+    local w = utf8_to_wide(path)
+    if not w then return nil end
+    local dat = ffi.new("WIN32_FILE_ATTRIBUTE_DATA[1]")
+    if kernel32.GetFileAttributesExW(w, 0, dat) == 0 then return nil end
+    return tonumber(dat[0].nFileSizeHigh) * 4294967296 + tonumber(dat[0].nFileSizeLow)
+end
+
+local function is_file_unlocked(path)
+    local ok, result = pcall(function()
+        local w = utf8_to_wide(path)
+        if not w then return true end
+        local handle = kernel32.CreateFileW(w, GENERIC_READ, 0, nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nil)
+        if handle == nil or handle == ffi.cast("HANDLE", -1) then return false end
+        kernel32.CloseHandle(handle)
+        return true
+    end)
+    return ok and result or true
 end
 
 local function get_last_replay_path(output)
@@ -342,7 +371,7 @@ local function try_call_start(now)
 end
 
 local function enqueue_finalize(id, path, duration, T_save)
-    finalize_queue[#finalize_queue + 1] = {id = id, path = path, duration = duration or 0, T_save = T_save, last_size = -1, stable_ticks = 0, deadline = now_ms() + FINALIZE_TIMEOUT_MS}
+    finalize_queue[#finalize_queue + 1] = {id = id, path = path, duration = duration or 0, T_save = T_save, deadline = now_ms() + FINALIZE_TIMEOUT_MS}
 end
 
 local function push_shared_memory(path, duration)
@@ -368,27 +397,15 @@ local function tick_finalize_queue()
     local now = now_ms()
     local remaining = {}
     for _, entry in ipairs(finalize_queue) do
-        local expired = entry.deadline and now >= entry.deadline
         local size = get_file_size(entry.path)
         if size == nil then
-            if expired then
-                if entry.id ~= "main" then pending_saves[entry.id] = nil end
-                handle_saved_finalized(entry.id, entry.T_save, entry.duration, nil)
-            else
-                remaining[#remaining + 1] = entry
-            end
+            finalize_and_handle(entry)
+        elseif is_file_unlocked(entry.path) then
+            finalize_and_handle(entry)
+        elseif entry.deadline and now >= entry.deadline then
+            finalize_and_handle(entry)
         else
-            if size == entry.last_size then
-                entry.stable_ticks = entry.stable_ticks + 1
-            else
-                entry.last_size = size
-                entry.stable_ticks = 0
-            end
-            if entry.stable_ticks >= FILE_STABLE_TICKS or expired then
-                finalize_and_handle(entry)
-            else
-                remaining[#remaining + 1] = entry
-            end
+            remaining[#remaining + 1] = entry
         end
     end
     finalize_queue = remaining

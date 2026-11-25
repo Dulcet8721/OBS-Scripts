@@ -7,11 +7,10 @@ local AUTO_STOP_TIMEOUT_MS = 10000
 local AUTO_START_RETRY_MS = 1000
 local AUTO_START_MAX_ATTEMPTS = 10
 local AUTO_SPLIT_GRACE_MS = 3000
-local CAPTURE_REFRESH_MS = 1000
 local PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 local CP_UTF8 = 65001
 local MAX_PATH_CHARS = 32768
-local FILE_READ_ATTRIBUTES = 0x80
+local GENERIC_READ = 0x80000000
 local OPEN_EXISTING = 3
 local FILE_ATTRIBUTE_NORMAL = 0x80
 local BRIDGE_NAME = "Local\\OBS_SFO_Bridge_v1"
@@ -33,7 +32,6 @@ local TR_NOTIFY_NAME = "Local\\OBS_TR_Notify_v1"
 local TR_STATUS_SIZE = 16
 local PR_STATUS_NAME = "Local\\OBS_PR_Status_v1"
 local PR_STATUS_SIZE = 16
-local PENDING_REPLAY_MAX_ATTEMPTS = 10
 local CONFIG = {enabled = true,auto_split = false}
 
 local STATE = {
@@ -46,7 +44,10 @@ local STATE = {
     captured_exes = {},
     source_signals = {},
     source_exe = {},
-    last_capture_refresh = 0,
+    source_refresh_pending = false,
+    scene_item_source = nil,
+    scene_item_handler = nil,
+    scene_item_cb = nil,
     active_context = nil,
     current_segment = nil,
     last_focus_key = nil,
@@ -63,7 +64,6 @@ local STATE = {
     current_recording_file = nil,
     recording_output = nil,
     recording_signal_handler = nil,
-    last_recording_check = 0,
     event_callback = nil,
     exiting = false,
     status_handle = nil,
@@ -71,9 +71,7 @@ local STATE = {
     status_hdr = nil,
     moved_handle = nil,
     moved_view = nil,
-    moved_hdr = nil,
-    pending_replay_path = nil,
-    pending_replay_attempts = 0
+    moved_hdr = nil
 }
 
 local ffi = require("ffi")
@@ -478,7 +476,7 @@ local function is_file_unlocked(path)
     local ok, result = pcall(function()
         local wpath = utf8_to_wide(normalize_slashes(path):gsub("/", "\\"))
         if not wpath then return true end
-        local handle = kernel32.CreateFileW(wpath, FILE_READ_ATTRIBUTES, 0, nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nil)
+        local handle = kernel32.CreateFileW(wpath, GENERIC_READ, 0, nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nil)
         if invalid_handle(handle) then return false end
         kernel32.CloseHandle(handle)
         return true
@@ -697,12 +695,30 @@ local function same_set(a, b)
     return true
 end
 
+local function current_scene_items()
+    local scene_source = obs.obs_frontend_get_current_scene()
+    if not scene_source then return nil end
+    local scene = obs.obs_scene_from_source(scene_source)
+    if not scene then
+        obs.obs_source_release(scene_source)
+        return nil
+    end
+    local items = obs.obs_scene_enum_items(scene)
+    if not items then
+        obs.obs_source_release(scene_source)
+        return nil
+    end
+    return items, scene_source
+end
+
 local function refresh_window_capture_exes()
     local captured = {}
-    local sources = obs.obs_enum_sources()
-    if sources then
-        for _, source in ipairs(sources) do
+    local items, scene_source = current_scene_items()
+    if items then
+        for _, item in ipairs(items) do
             pcall(function()
+                local source = obs.obs_sceneitem_get_source(item)
+                if not source then return end
                 if obs.obs_source_get_id(source) ~= "window_capture" then return end
                 local active = true
                 if obs.obs_source_active then
@@ -718,7 +734,8 @@ local function refresh_window_capture_exes()
                 end
             end)
         end
-        if obs.source_list_release then obs.source_list_release(sources) end
+        obs.sceneitem_list_release(items)
+        obs.obs_source_release(scene_source)
     end
     local changed = not same_set(STATE.window_capture_exes, captured)
     STATE.window_capture_exes = captured
@@ -779,15 +796,6 @@ local function refresh_focus_now()
     update_focus_if_changed()
 end
 
-local function refresh_capture_if_due()
-    local now = now_ms()
-    if now - STATE.last_capture_refresh < CAPTURE_REFRESH_MS then return end
-    STATE.last_capture_refresh = now
-    if refresh_window_capture_exes() then
-        STATE.focus_context = compute_focus_context()
-    end
-end
-
 local function make_capture_callback(source)
     return function()
         local hooked, exe = get_hooked_info(source)
@@ -817,44 +825,125 @@ end
 local function release_source_signals()
     for source, info in pairs(STATE.source_signals) do
         pcall(function()
-            obs.signal_handler_disconnect(info.handler, "hooked", info.cb)
-            obs.signal_handler_disconnect(info.handler, "unhooked", info.cb)
+            if info.hook_cb then
+                obs.signal_handler_disconnect(info.handler, "hooked", info.hook_cb)
+                obs.signal_handler_disconnect(info.handler, "unhooked", info.hook_cb)
+            end
+            if info.change_cb then
+                obs.signal_handler_disconnect(info.handler, "update", info.change_cb)
+                obs.signal_handler_disconnect(info.handler, "rename", info.change_cb)
+            end
         end)
         pcall(obs.obs_source_release, source)
     end
     STATE.source_signals = {}
     STATE.source_exe = {}
     STATE.game_capture_exes = {}
+    if STATE.scene_item_source then
+        if STATE.scene_item_handler and STATE.scene_item_cb then
+            pcall(function()
+                obs.signal_handler_disconnect(STATE.scene_item_handler, "item_add", STATE.scene_item_cb)
+                obs.signal_handler_disconnect(STATE.scene_item_handler, "item_remove", STATE.scene_item_cb)
+                obs.signal_handler_disconnect(STATE.scene_item_handler, "rename", STATE.scene_item_cb)
+            end)
+        end
+        pcall(obs.obs_source_release, STATE.scene_item_source)
+        STATE.scene_item_source = nil
+    end
+    STATE.scene_item_handler = nil
+    STATE.scene_item_cb = nil
     rebuild_captured_exes()
+end
+
+local function mark_source_refresh_pending()
+    STATE.source_refresh_pending = true
+end
+
+local function subscribe_scene_items()
+    local scene = obs.obs_frontend_get_current_scene()
+    if not scene then return end
+    local handler = obs.obs_source_get_signal_handler(scene)
+    if not handler then
+        obs.obs_source_release(scene)
+        return
+    end
+    local cb = mark_source_refresh_pending
+    if obs.signal_handler_connect(handler, "item_add", cb)
+        and obs.signal_handler_connect(handler, "item_remove", cb)
+        and obs.signal_handler_connect(handler, "rename", cb) then
+        STATE.scene_item_source = scene
+        STATE.scene_item_handler = handler
+        STATE.scene_item_cb = cb
+        return
+    end
+    pcall(function()
+        obs.signal_handler_disconnect(handler, "item_add", cb)
+        obs.signal_handler_disconnect(handler, "item_remove", cb)
+        obs.signal_handler_disconnect(handler, "rename", cb)
+    end)
+    obs.obs_source_release(scene)
 end
 
 local function rescan_sources()
     release_source_signals()
-    local sources = obs.obs_enum_sources()
-    if sources then
-        for _, source in ipairs(sources) do
+    local captured = {}
+    local items, scene_source = current_scene_items()
+    if items then
+        for _, item in ipairs(items) do
             pcall(function()
-                if obs.obs_source_get_id(source) ~= "game_capture" then return end
+                local source = obs.obs_sceneitem_get_source(item)
+                if not source then return end
+                if STATE.source_signals[source] then return end
+                local id = obs.obs_source_get_id(source)
+                if id ~= "game_capture" and id ~= "window_capture" then return end
                 local handler = obs.obs_source_get_signal_handler(source)
                 if not handler then return end
-                local cb = make_capture_callback(source)
-                if obs.signal_handler_connect(handler, "hooked", cb) then
-                    obs.signal_handler_connect(handler, "unhooked", cb)
-                    obs.obs_source_get_ref(source)
-                    STATE.source_signals[source] = { handler = handler, cb = cb }
+                local info = { handler = handler }
+                local change_cb = mark_source_refresh_pending
+                if obs.signal_handler_connect(handler, "update", change_cb) then
+                    obs.signal_handler_connect(handler, "rename", change_cb)
+                    info.change_cb = change_cb
                 end
-                local hooked, exe = get_hooked_info(source)
-                if hooked and exe and exe ~= "" then
-                    local key = normalize_exe_name(exe)
-                    if key ~= "" then
-                        STATE.source_exe[source] = key
-                        STATE.game_capture_exes[key] = true
+                if id == "game_capture" then
+                    local cb = make_capture_callback(source)
+                    if obs.signal_handler_connect(handler, "hooked", cb) then
+                        obs.signal_handler_connect(handler, "unhooked", cb)
+                        info.hook_cb = cb
+                        local hooked, exe = get_hooked_info(source)
+                        if hooked and exe and exe ~= "" then
+                            local key = normalize_exe_name(exe)
+                            if key ~= "" then
+                                STATE.source_exe[source] = key
+                                STATE.game_capture_exes[key] = true
+                            end
+                        end
                     end
+                else
+                    local active = true
+                    if obs.obs_source_active then
+                        local ok_a, v = pcall(obs.obs_source_active, source)
+                        if ok_a then active = v end
+                    end
+                    local width = tonumber(obs.obs_source_get_width(source)) or 0
+                    if active and width > 0 then
+                        local exe = window_capture_exe(source)
+                        if exe and exe ~= "" then
+                            local key = normalize_exe_name(exe)
+                            if key ~= "" then captured[key] = true end
+                        end
+                    end
+                end
+                if info.hook_cb or info.change_cb then
+                    obs.obs_source_get_ref(source)
+                    STATE.source_signals[source] = info
                 end
             end)
         end
-        if obs.source_list_release then obs.source_list_release(sources) end
+        obs.sceneitem_list_release(items)
+        obs.obs_source_release(scene_source)
     end
+    STATE.window_capture_exes = captured
+    subscribe_scene_items()
     rebuild_captured_exes()
     refresh_focus_now()
 end
@@ -900,11 +989,11 @@ local function process_file(job)
     base = normalize_slashes(base):gsub("/+$", "")
     context.base_dir = base
     local target_directory = base .. "/" .. folder
+    if not is_file_unlocked(path) then return false end
     if path_is_inside(path, target_directory) then
         moved_write(path, folder, 1)
         return true
     end
-    if not is_file_unlocked(path) then return false end
     if not file_exists(target_directory) then
         if not recursive_mkdir(target_directory) then return false end
     end
@@ -1080,7 +1169,6 @@ local function on_recording_started()
     STATE.auto_restart = false
     STATE.auto_start_attempts = 0
     STATE.auto_start_last_try = 0
-    STATE.last_recording_check = 0
     STATE.baseline_refresh_pending = false
     connect_recording()
     if CONFIG.auto_split then
@@ -1222,27 +1310,13 @@ local function auto_split_tick()
     end
 end
 
-local function recover_recording()
-    if not STATE.recording_output then
-        if connect_recording() then
-            if CONFIG.auto_split and not STATE.current_segment then
-                refresh_focus_now()
-                STATE.current_segment = STATE.focus_context
-                STATE.last_focus_key = focus_key(STATE.current_segment)
-                STATE.auto_split_grace_until = now_ms() + AUTO_SPLIT_GRACE_MS
-            elseif not CONFIG.auto_split and not STATE.active_context then
-                STATE.active_context = snapshot_context()
-            end
-        end
-    elseif not STATE.current_recording_file then
-        STATE.current_recording_file = recording_current_file(STATE.recording_output)
-    end
-end
-
 local function on_frontend_event(event)
     if event == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING then
-        if CONFIG.enabled and recording_active() and not STATE.recording_output then
-            on_recording_started()
+        if CONFIG.enabled then
+            rescan_sources()
+            if recording_active() and not STATE.recording_output then
+                on_recording_started()
+            end
         end
     elseif event == obs.OBS_FRONTEND_EVENT_SCENE_CHANGED then
         if CONFIG.enabled then
@@ -1260,8 +1334,8 @@ local function on_frontend_event(event)
         if CONFIG.enabled and not pr_is_processing() and not tr_is_processing() then
             local path = obs.obs_frontend_get_last_replay()
             if path and path ~= "" then
-                STATE.pending_replay_path = path
-                STATE.pending_replay_attempts = 0
+                refresh_focus_now()
+                queue_file(path, "replay", snapshot_context())
             end
         end
     elseif event == obs.OBS_FRONTEND_EVENT_SCREENSHOT_TAKEN then
@@ -1279,8 +1353,6 @@ local function on_frontend_event(event)
 			STATE.event_callback = nil
 		end
 		disconnect_recording()
-		STATE.pending_replay_path = nil
-		STATE.pending_replay_attempts = 0
     end
 end
 
@@ -1332,8 +1404,6 @@ function script_update(settings)
     if not CONFIG.enabled then
         STATE.queue = {}
         STATE.seen = {}
-        STATE.pending_replay_path = nil
-        STATE.pending_replay_attempts = 0
         disconnect_recording()
         STATE.pending_auto_start = false
         STATE.pending_start_segment = nil
@@ -1394,49 +1464,20 @@ function script_tick(seconds)
         if #STATE.queue > 0 then
             STATE.queue = {}
         end
-        STATE.pending_replay_path = nil
-        STATE.pending_replay_attempts = 0
         return
     end
-    if STATE.pending_replay_path then
-        STATE.pending_replay_attempts = STATE.pending_replay_attempts + 1
-        local path = STATE.pending_replay_path
-        local ok, result = pcall(function()
-            refresh_focus_now()
-            local ctx = snapshot_context()
-            return queue_file(path, "replay", ctx)
-        end)
-        if not ok then
-            if STATE.pending_replay_attempts >= PENDING_REPLAY_MAX_ATTEMPTS then
-                STATE.pending_replay_path = nil
-                STATE.pending_replay_attempts = 0
-            end
-        elseif result then
-            STATE.pending_replay_path = nil
-            STATE.pending_replay_attempts = 0
-        else
-            STATE.pending_replay_path = nil
-            STATE.pending_replay_attempts = 0
-        end
+    if STATE.source_refresh_pending then
+        STATE.source_refresh_pending = false
+        pcall(rescan_sources)
     end
     pcall(update_focus_if_changed)
-    local rb_active = obs.obs_frontend_replay_buffer_active and obs.obs_frontend_replay_buffer_active() or false
-    if STATE.recording_output or rb_active then
-        pcall(refresh_capture_if_due)
-    end
     pcall(read_bridge)
     pcall(process_queue)
     local active = recording_active()
-    if active then
-        if STATE.recording_output and not CONFIG.auto_split then
-            local focus = STATE.focus_context
-            if focus and focus.matched then
-                STATE.active_context = focus
-            end
-        end
-        if not STATE.recording_output and now_ms() - STATE.last_recording_check >= 1000 then
-            STATE.last_recording_check = now_ms()
-            pcall(recover_recording)
+    if active and STATE.recording_output and not CONFIG.auto_split then
+        local focus = STATE.focus_context
+        if focus and focus.matched then
+            STATE.active_context = focus
         end
     end
     if STATE.baseline_refresh_pending then
@@ -1461,8 +1502,6 @@ function script_unload()
     pcall(moved_close)
     STATE.queue = {}
     STATE.seen = {}
-    STATE.pending_replay_path = nil
-    STATE.pending_replay_attempts = 0
     STATE.focus_hwnd = nil
     STATE.focus_context = nil
     STATE.active_context = nil

@@ -6,9 +6,11 @@ ffi.cdef[[
     typedef void* HANDLE;
     typedef int BOOL;
     typedef unsigned long DWORD;
+    typedef unsigned short wchar_t;
     DWORD GetWindowThreadProcessId(HWND hWnd, DWORD* lpdwProcessId);
     void* OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
-    BOOL QueryFullProcessImageNameA(void* hProcess, DWORD dwFlags, char* lpExeName, DWORD* lpdwSize);
+    BOOL QueryFullProcessImageNameW(void* hProcess, DWORD dwFlags, wchar_t* lpExeName, DWORD* lpdwSize);
+    int WideCharToMultiByte(unsigned int CodePage, DWORD dwFlags, const wchar_t* lpWideCharStr, int cchWideChar, char* lpMultiByteStr, int cbMultiByte, const char* lpDefaultChar, BOOL* lpUsedDefaultChar);
     BOOL CloseHandle(HANDLE hObject);
     void* GetForegroundWindow(void);
     unsigned long long GetTickCount64(void);
@@ -180,13 +182,18 @@ local function get_process_name_from_hwnd(hwnd)
     if pid[0] == 0 then return nil end
     local hProcess = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid[0])
     if not is_valid_handle(hProcess) then return nil end
-    local EXE_PATH_BUF = 32767
-    local exePath = ffi.new("char[?]", EXE_PATH_BUF)
-    local dwSize = ffi.new("DWORD[1]", EXE_PATH_BUF)
-    local success = kernel32.QueryFullProcessImageNameA(hProcess, 0, exePath, dwSize)
+    local EXE_PATH_CHARS = 32767
+    local exePathW = ffi.new("wchar_t[?]", EXE_PATH_CHARS)
+    local dwSize = ffi.new("DWORD[1]", EXE_PATH_CHARS)
+    local success = kernel32.QueryFullProcessImageNameW(hProcess, 0, exePathW, dwSize)
     kernel32.CloseHandle(hProcess)
-    if success == 0 then return nil end
-    local path = ffi.string(exePath)
+    if success == 0 or dwSize[0] == 0 then return nil end
+    local chars = tonumber(dwSize[0])
+    local utf8_size = kernel32.WideCharToMultiByte(65001, 0, exePathW, chars, nil, 0, nil, nil)
+    if not utf8_size or utf8_size <= 0 then return nil end
+    local utf8_buf = ffi.new("char[?]", utf8_size + 1)
+    kernel32.WideCharToMultiByte(65001, 0, exePathW, chars, utf8_buf, utf8_size, nil, nil)
+    local path = ffi.string(utf8_buf, utf8_size)
     local name = path:match("([^\\]+)$")
     return name and name:lower() or nil
 end

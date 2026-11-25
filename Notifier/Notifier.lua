@@ -20,6 +20,12 @@ local TR_NOTIFY_SLOT = 1024
 local TR_NOTIFY_SLOTS = 128
 local TR_NOTIFY_TOTAL = TR_NOTIFY_HEADER + TR_NOTIFY_SLOT * TR_NOTIFY_SLOTS
 local TR_NOTIFY_PAYLOAD_MAX = TR_NOTIFY_SLOT - 8
+local EFC_NOTIFY_NAME = "Local\\OBS_EFC_Notify_v1"
+local EFC_NOTIFY_HEADER = 8
+local EFC_NOTIFY_SLOT = 1024
+local EFC_NOTIFY_SLOTS = 128
+local EFC_NOTIFY_TOTAL = EFC_NOTIFY_HEADER + EFC_NOTIFY_SLOT * EFC_NOTIFY_SLOTS
+local EFC_NOTIFY_PAYLOAD_MAX = EFC_NOTIFY_SLOT - 8
 local TR_STATUS_NAME = "Local\\OBS_TR_Status_v1"
 local TR_STATUS_SIZE = 16
 local PR_STATUS_NAME = "Local\\OBS_PR_Status_v1"
@@ -31,6 +37,7 @@ local WND_TITLE_NAME = "NotifierAlert"
 local CONFIG = {
     visual_enabled = true,
     sound_enabled = true,
+    show_meta_line = true,
     scale = 100,
     position = "top_right",
     duration = 3.0,
@@ -41,10 +48,12 @@ local STATE = {
     sfo_moved_rs = nil,
     pr_notify_rs = nil,
     tr_notify_rs = nil,
+    efc_notify_rs = nil,
     pending = {},
     alert_queue = {},
     active_alert = nil,
     sound_files = {},
+    sound_cache = nil,
     event_callback = nil,
     exiting = false,
     popup_hwnd = nil,
@@ -52,11 +61,14 @@ local STATE = {
     popup_class_atom = nil,
     title_font = nil,
     body_font = nil,
+    meta_font = nil,
     alpha_value = 0,
     alpha_ramp = 0,
     popup_deadline = 0,
     heading_text = "",
     body_text = "",
+    meta_text = "",
+    lang_is_ru = false,
     fonts_need_refresh = false,
     backbuffer_dc = nil,
     backbuffer_bitmap = nil,
@@ -101,6 +113,9 @@ ffi.cdef[[
     void* MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
     BOOL UnmapViewOfFile(void*);
     BOOL CloseHandle(HANDLE);
+    HANDLE CreateFileW(const wchar_t*, DWORD, DWORD, void*, DWORD, DWORD, HANDLE);
+    BOOL ReadFile(HANDLE, void*, DWORD, DWORD*, void*);
+    BOOL SetFilePointerEx(HANDLE, int64_t, int64_t*, DWORD);
     typedef LRESULT (*WNDPROC)(HWND, UINT, WPARAM, LPARAM);
     typedef struct tagWNDCLASSEXA {
         UINT cbSize;
@@ -199,6 +214,7 @@ local WIN = {
     SND_FILENAME = 0x00020000,
     SND_ASYNC = 0x0001,
     SND_NODEFAULT = 0x0002,
+    SND_MEMORY = 0x0004,
     CS_HREDRAW = 0x0002,
     CS_VREDRAW = 0x0001,
     BG_COLOR = rgb(30, 30, 30),
@@ -210,13 +226,15 @@ local WIN = {
 }
 
 local PANEL_W = 350
-local PANEL_H = 80
+local PANEL_H = 100
+local LEGACY_PANEL_H = 80
 local PANEL_INSET = 16
 local ALPHA_STEP = 10
-local ALPHA_LIMIT = 220
+local ALPHA_LIMIT = 240
 local TICK_MS = 10
 local HEADING_PX = -18
-local BODY_PX = -14
+local BODY_PX = -16
+local META_PX = -14
 local STRIPE_PX = 5
 local CENTER_TEXT = WIN.DT_CENTER + WIN.DT_VCENTER + WIN.DT_SINGLELINE
 
@@ -250,6 +268,7 @@ local function init_locale()
     if obs.obs_get_locale then
         lang = obs.obs_get_locale() or lang
     end
+    STATE.lang_is_ru = tostring(lang):sub(1, 2):lower() == "ru"
     default_loc = load_locale_file(loc_dir .. "en-US " .. LOCALE_NAME .. ".json")
     current_loc = load_locale_file(loc_dir .. tostring(lang) .. " " .. LOCALE_NAME .. ".json")
         or load_locale_file(loc_dir .. tostring(lang):sub(1, 2) .. " " .. LOCALE_NAME .. ".json")
@@ -340,6 +359,17 @@ local function root_folder_basename(media_type, file_path)
     return basename(dir)
 end
 
+local function replay_max_duration()
+    local out = obs.obs_frontend_get_replay_buffer_output()
+    if not out then return nil end
+    local settings = obs.obs_output_get_settings(out)
+    local v = settings and tonumber(obs.obs_data_get_int(settings, "max_time_sec")) or 0
+    if settings then obs.obs_data_release(settings) end
+    obs.obs_output_release(out)
+    if v and v > 0 then return v end
+    return nil
+end
+
 local function bridge_wide(s)
     local b = ffi.new("unsigned short[?]", #s + 1)
     for i = 1, #s do
@@ -356,6 +386,267 @@ local function wide(s)
     local buf = ffi.new("unsigned short[?]", len)
     if kernel32.MultiByteToWideChar(UTF8_CP, 0, s, -1, buf, len) == 0 then return nil end
     return buf
+end
+
+local GENERIC_READ = 0x80000000
+local FILE_SHARE_READ = 0x00000001
+local OPEN_EXISTING = 3
+local IMAGE_HEADER_MAX = 262144
+
+local function file_size(path)
+    local w = wide(path)
+    if not w then return nil end
+    local dat = ffi.new("WIN32_FIND_DATAW")
+    local h = kernel32.FindFirstFileW(w, dat)
+    if h == nil or h == ffi.cast("HANDLE", -1) or h == ffi.cast("HANDLE", 0) then return nil end
+    kernel32.FindClose(h)
+    return tonumber(dat.nFileSizeHigh) * 4294967296 + tonumber(dat.nFileSizeLow)
+end
+
+local function read_file_header(path, nbytes)
+    local w = wide(path)
+    if not w then return nil end
+    local h = kernel32.CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, nil, OPEN_EXISTING, 0, nil)
+    if h == nil or h == ffi.cast("HANDLE", -1) or h == ffi.cast("HANDLE", 0) then return nil end
+    local buf = ffi.new("unsigned char[?]", nbytes)
+    local read = ffi.new("DWORD[1]")
+    local ok = kernel32.ReadFile(h, buf, nbytes, read, nil)
+    kernel32.CloseHandle(h)
+    if ok == 0 or read[0] == 0 then return nil end
+    return buf, tonumber(read[0])
+end
+
+local function image_resolution(path)
+    if not path or path == "" then return nil end
+    local buf, n = read_file_header(path, IMAGE_HEADER_MAX)
+    if not buf or not n or n < 24 then return nil end
+    local png_sig = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }
+    for i = 1, 8 do
+        if buf[i-1] ~= png_sig[i] then
+            png_sig = nil
+            break
+        end
+    end
+    if png_sig and n >= 24 then
+        return string.format("%dx%d", buf[16] * 16777216 + buf[17] * 65536 + buf[18] * 256 + buf[19],
+            buf[20] * 16777216 + buf[21] * 65536 + buf[22] * 256 + buf[23])
+    end
+    if buf[0] == 0x42 and buf[1] == 0x4D and n >= 26 then
+        local function le32(off)
+            local v = buf[off] + buf[off+1] * 256 + buf[off+2] * 65536 + buf[off+3] * 16777216
+            if v >= 2147483648 then v = v - 4294967296 end
+            return v
+        end
+        local wpx = le32(18)
+        local hpx = le32(22)
+        if wpx > 0 and hpx ~= 0 then
+            return string.format("%dx%d", wpx, math.abs(hpx))
+        end
+        return nil
+    end
+    if buf[0] == 0xFF and buf[1] == 0xD8 then
+        local pos = 2
+        while pos + 9 <= n do
+            if buf[pos] ~= 0xFF then
+                pos = pos + 1
+            else
+                while buf[pos] == 0xFF do pos = pos + 1 end
+                local marker = buf[pos]
+                if marker == 0xD8 or (marker >= 0xD0 and marker <= 0xD7) or marker == 0x01 then
+                    pos = pos + 1
+                elseif marker == 0xDA or marker == 0xD9 then
+                    return nil
+                else
+                    local seglen = buf[pos+1] * 256 + buf[pos+2]
+                    if seglen < 2 then return nil end
+                    local is_sof = (marker >= 0xC0 and marker <= 0xCF and marker ~= 0xC4 and marker ~= 0xC8 and marker ~= 0xCC)
+                    if is_sof and pos + 8 <= n then
+                        local hpx = buf[pos+4] * 256 + buf[pos+5]
+                        local wpx = buf[pos+6] * 256 + buf[pos+7]
+                        if wpx > 0 and hpx > 0 then
+                            return string.format("%dx%d", wpx, hpx)
+                        end
+                        return nil
+                    end
+                    pos = pos + seglen + 1
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local MKV_SCAN_MAX = 524288
+local VIDEO_DURATION_MIN = 0.2
+local VIDEO_DURATION_MAX = 86400
+
+local function video_duration_sec(d)
+    if not d or d ~= d or d <= VIDEO_DURATION_MIN or d > VIDEO_DURATION_MAX then return nil end
+    return d
+end
+
+local function mp4_video_duration(path)
+    local w = wide(path)
+    if not w then return nil end
+    local h = kernel32.CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, nil, OPEN_EXISTING, 0, nil)
+    if h == nil or h == ffi.cast("HANDLE", -1) or h == ffi.cast("HANDLE", 0) then return nil end
+    local result
+    local ok, err = pcall(function()
+        local newpos = ffi.new("int64_t[1]")
+        local function read_at(off, buf, nbytes)
+            if kernel32.SetFilePointerEx(h, off, newpos, 0) == 0 then return false end
+            local got = ffi.new("DWORD[1]")
+            if kernel32.ReadFile(h, buf, nbytes, got, nil) == 0 then return false end
+            return got[0] == nbytes
+        end
+        local function u32be(b, o)
+            return b[o] * 16777216 + b[o + 1] * 65536 + b[o + 2] * 256 + b[o + 3]
+        end
+        local function u64be(b, o)
+            return u32be(b, o) * 4294967296 + u32be(b, o + 4)
+        end
+        local pos = 0
+        while true do
+            local hdr = ffi.new("unsigned char[8]")
+            if not read_at(pos, hdr, 8) then break end
+            local size = u32be(hdr, 0)
+            local tag = ffi.string(hdr + 4, 4)
+            if size == 1 then
+                local ext = ffi.new("unsigned char[8]")
+                if not read_at(pos + 8, ext, 8) then break end
+                size = u64be(ext, 0)
+            end
+            if size == 0 then size = 8 end
+            if tag == "moov" then
+                local cpos = pos + 8
+                while true do
+                    local chdr = ffi.new("unsigned char[8]")
+                    if not read_at(cpos, chdr, 8) then break end
+                    local csize = u32be(chdr, 0)
+                    local ctag = ffi.string(chdr + 4, 4)
+                    if csize == 0 then csize = 8 end
+                    if ctag == "mvhd" then
+                        local v = ffi.new("unsigned char[40]")
+                        if read_at(cpos + 8, v, 40) then
+                            local ts, dur
+                            if v[0] == 1 then
+                                ts = u32be(v, 20)
+                                dur = u64be(v, 24)
+                            else
+                                ts = u32be(v, 12)
+                                dur = u32be(v, 16)
+                            end
+                            if ts and ts > 0 and dur and dur > 0 then
+                                result = video_duration_sec(dur / ts)
+                            end
+                        end
+                        break
+                    end
+                    cpos = cpos + csize
+                end
+                break
+            end
+            if size <= 0 then break end
+            pos = pos + size
+        end
+    end)
+    kernel32.CloseHandle(h)
+    if not ok then
+        print("[Notifier] mp4 duration parse failed: " .. tostring(err))
+        return nil
+    end
+    return result
+end
+
+local function mkv_video_duration(path)
+    local buf, n = read_file_header(path, MKV_SCAN_MAX)
+    if not buf or not n or n < 32 then return nil end
+    local timescale = 1000000
+    local dur_units = nil
+    for i = 0, n - 11 do
+        if buf[i] == 0x2A and buf[i + 1] == 0xD7 and buf[i + 2] == 0xB1 then
+            if buf[i + 3] == 0x83 then
+                local ts = buf[i + 4] * 65536 + buf[i + 5] * 256 + buf[i + 6]
+                if ts > 0 then timescale = ts end
+            end
+        elseif buf[i] == 0x44 and buf[i + 1] == 0x89 and (buf[i + 2] == 0x84 or buf[i + 2] == 0x88) then
+            if buf[i + 2] == 0x84 then
+                local fbuf = ffi.new("unsigned char[4]", { buf[i + 6], buf[i + 5], buf[i + 4], buf[i + 3] })
+                local val = tonumber(ffi.cast("float*", fbuf)[0])
+                if val and val == val and val > 0 then
+                    dur_units = val
+                end
+            else
+                local fbuf = ffi.new("unsigned char[8]", {
+                    buf[i + 10], buf[i + 9], buf[i + 8], buf[i + 7],
+                    buf[i + 6], buf[i + 5], buf[i + 4], buf[i + 3]
+                })
+                local val = tonumber(ffi.cast("double*", fbuf)[0])
+                if val and val == val and val > 0 then
+                    dur_units = val
+                end
+            end
+        end
+        if dur_units then break end
+    end
+    if not dur_units then return nil end
+    return video_duration_sec(dur_units * timescale / 1000000000)
+end
+
+local function video_duration(path)
+    if not path or path == "" then return nil end
+    local ext = (path:match("%.([%w]+)$") or ""):lower()
+    if ext == "mp4" or ext == "mov" or ext == "m4v" or ext == "m4a" then
+        return mp4_video_duration(path)
+    elseif ext == "mkv" or ext == "webm" then
+        return mkv_video_duration(path)
+    end
+    return nil
+end
+
+local function fmt_num(v)
+    local s = string.format("%.1f", v)
+    if STATE.lang_is_ru then s = s:gsub("%.", ",") end
+    return s
+end
+
+local function format_size(bytes)
+    if not bytes or bytes <= 0 then return nil end
+    if bytes >= 1073741824 then
+        return fmt_num(bytes / 1073741824) .. " " .. getString("SizeGB")
+    elseif bytes >= 1048576 then
+        return fmt_num(bytes / 1048576) .. " " .. getString("SizeMB")
+    elseif bytes >= 1024 then
+        return fmt_num(bytes / 1024) .. " " .. getString("SizeKB")
+    end
+    return tostring(math.floor(bytes)) .. " " .. getString("SizeB")
+end
+
+local function format_duration(sec)
+    sec = math.floor(tonumber(sec) or 0)
+    if sec <= 0 then return nil end
+    local h = math.floor(sec / 3600)
+    local m = math.floor((sec % 3600) / 60)
+    local s = sec % 60
+    if h > 0 then return string.format("%d:%02d:%02d", h, m, s) end
+    return string.format("%d:%02d", m, s)
+end
+
+local function build_meta(path, duration, resolution)
+    local parts = {}
+    if resolution and resolution ~= "" then
+        parts[#parts + 1] = resolution
+    end
+    local dur_text = format_duration(duration)
+    if dur_text then
+        parts[#parts + 1] = dur_text
+    end
+    local size_text = format_size(file_size(path))
+    if size_text then
+        parts[#parts + 1] = size_text
+    end
+    if #parts == 0 then return "" end
+    return table.concat(parts, getString("MetaSeparator"))
 end
 
 local function sfo_status_read()
@@ -524,6 +815,39 @@ local function tr_notify_read_new()
     return events
 end
 
+local function efc_notify_read_new()
+    local h = kernel32.OpenFileMappingW(0x000F001F, 0, bridge_wide(EFC_NOTIFY_NAME))
+    if h == nil or h == ffi.cast("HANDLE", 0) then
+        STATE.efc_notify_rs = nil
+        return {}
+    end
+    local v = kernel32.MapViewOfFile(h, 0x000F001F, 0, 0, EFC_NOTIFY_TOTAL)
+    if v == nil then
+        kernel32.CloseHandle(h)
+        return {}
+    end
+    local hdr = ffi.cast("unsigned int*", v)
+    local ws = tonumber(hdr[0]) or 0
+    local events = {}
+    if STATE.efc_notify_rs == nil then STATE.efc_notify_rs = ws end
+    if STATE.efc_notify_rs > ws then STATE.efc_notify_rs = ws end
+    while STATE.efc_notify_rs < ws do
+        local idx = STATE.efc_notify_rs % EFC_NOTIFY_SLOTS
+        local slot = ffi.cast("unsigned char*", v) + EFC_NOTIFY_HEADER + idx * EFC_NOTIFY_SLOT
+        local dur = tonumber(ffi.cast("unsigned int*", slot)[0])
+        local plen = tonumber(ffi.cast("unsigned int*", slot + 4)[0])
+        if dur == 0 and plen > 0 and plen <= EFC_NOTIFY_PAYLOAD_MAX then
+            local pbuf = ffi.new("char[?]", plen)
+            ffi.copy(pbuf, slot + 8, plen)
+            events[#events + 1] = { path = ffi.string(pbuf, plen) }
+        end
+        STATE.efc_notify_rs = STATE.efc_notify_rs + 1
+    end
+    kernel32.UnmapViewOfFile(v)
+    kernel32.CloseHandle(h)
+    return events
+end
+
 local function list_sound_files()
     local dir = (script_path():match("(.*[/\\])") or "") .. "notification sounds"
     local files = {}
@@ -578,7 +902,7 @@ end
 local function paint_popup()
     if STATE.popup_hwnd == nil then return end
     if not user32.IsWindow(STATE.popup_hwnd) then return end
-    if STATE.title_font == nil or STATE.body_font == nil then return end
+    if STATE.title_font == nil or STATE.body_font == nil or STATE.meta_font == nil then return end
     local hdc = user32.GetDC(STATE.popup_hwnd)
     if hdc == nil then return end
     local rect = ffi.new("RECT")
@@ -623,7 +947,7 @@ local function paint_popup()
         if not title or title == "" then title = " " end
         local text_left = stripe + math.floor(9 * s)
         local text_right = w - math.floor(12 * s)
-        local title_rect = ffi.new("RECT", {text_left, math.floor(10 * s), text_right, math.floor(46 * s)})
+        local title_rect = ffi.new("RECT", {text_left, math.floor(8 * s), text_right, math.floor(38 * s)})
         local tw = wide(title)
         if tw then
             user32.DrawTextW(mdc, tw, -1, title_rect, CENTER_TEXT)
@@ -634,12 +958,24 @@ local function paint_popup()
         gdi32.SetTextColor(mdc, WIN.SUB_COLOR)
         local msg = STATE.body_text or ""
         if msg ~= "" then
-            local msg_rect = ffi.new("RECT", {text_left, math.floor(46 * s), text_right, h - math.floor(8 * s)})
+            local msg_rect = ffi.new("RECT", {text_left, math.floor(38 * s), text_right, math.floor(64 * s)})
             local mw = wide(msg)
             if mw then
                 user32.DrawTextW(mdc, mw, -1, msg_rect, CENTER_TEXT)
             else
                 user32.DrawTextA(mdc, msg, -1, msg_rect, CENTER_TEXT)
+            end
+        end
+        gdi32.SelectObject(mdc, STATE.meta_font)
+        gdi32.SetTextColor(mdc, WIN.SUB_COLOR)
+        local meta = STATE.meta_text or ""
+        if CONFIG.show_meta_line and meta ~= "" then
+            local meta_rect = ffi.new("RECT", {text_left, math.floor(64 * s), text_right, h - math.floor(8 * s)})
+            local tw2 = wide(meta)
+            if tw2 then
+                user32.DrawTextW(mdc, tw2, -1, meta_rect, CENTER_TEXT)
+            else
+                user32.DrawTextA(mdc, meta, -1, meta_rect, CENTER_TEXT)
             end
         end
         if old ~= nil then
@@ -659,6 +995,9 @@ local function prepare_fonts()
     if STATE.body_font == nil then
         STATE.body_font = gdi32.CreateFontA(math.floor(BODY_PX * s), 0, 0, 0, 400, 0, 0, 0, WIN.DEFAULT_CHARSET, WIN.OUT_DEFAULT_PRECIS, WIN.CLIP_DEFAULT_PRECIS, WIN.CLEARTYPE_QUALITY, WIN.DEFAULT_PITCH, "Segoe UI")
     end
+    if STATE.meta_font == nil then
+        STATE.meta_font = gdi32.CreateFontA(math.floor(META_PX * s), 0, 0, 0, 400, 0, 0, 0, WIN.DEFAULT_CHARSET, WIN.OUT_DEFAULT_PRECIS, WIN.CLIP_DEFAULT_PRECIS, WIN.CLEARTYPE_QUALITY, WIN.DEFAULT_PITCH, "Segoe UI")
+    end
 end
 
 local function refresh_fonts()
@@ -670,12 +1009,16 @@ local function refresh_fonts()
         gdi32.DeleteObject(STATE.body_font)
         STATE.body_font = nil
     end
+    if STATE.meta_font then
+        gdi32.DeleteObject(STATE.meta_font)
+        STATE.meta_font = nil
+    end
     prepare_fonts()
 end
 
 local function position_xy(scale)
     local w = math.floor(PANEL_W * scale)
-    local h = math.floor(PANEL_H * scale)
+    local h = math.floor((CONFIG.show_meta_line and PANEL_H or LEGACY_PANEL_H) * scale)
     local m = PANEL_INSET
     local sw = user32.GetSystemMetrics(WIN.SM_CXSCREEN)
     local sh = user32.GetSystemMetrics(WIN.SM_CYSCREEN)
@@ -732,21 +1075,60 @@ local function ensure_notification_window()
     return STATE.popup_hwnd
 end
 
+local function read_whole_file(path)
+    local size = file_size(path)
+    if not size or size < 44 or size > 67108864 then return nil end
+    local w = wide(path)
+    if not w then return nil end
+    local h = kernel32.CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, nil, OPEN_EXISTING, 0, nil)
+    if h == nil or h == ffi.cast("HANDLE", -1) or h == ffi.cast("HANDLE", 0) then return nil end
+    local buf = ffi.new("unsigned char[?]", size)
+    local read = ffi.new("DWORD[1]")
+    local total = 0
+    while total < size do
+        read[0] = 0
+        local ok = kernel32.ReadFile(h, ffi.cast("unsigned char*", buf) + total, size - total, read, nil)
+        if ok == 0 or read[0] == 0 then break end
+        total = total + tonumber(read[0])
+    end
+    kernel32.CloseHandle(h)
+    if total ~= size then return nil end
+    return buf
+end
+
+local function clear_sound_cache(stop)
+    if stop and winmm then pcall(winmm.PlaySoundW, nil, nil, 0) end
+    STATE.sound_cache = nil
+end
+
+local function ensure_sound_cache()
+    if CONFIG.sound_file == "" then
+        if STATE.sound_cache then clear_sound_cache(true) end
+        return nil
+    end
+    local dir = (script_path():match("(.*[/\\])") or "") .. "notification sounds\\"
+    local full = dir .. CONFIG.sound_file
+    local cache = STATE.sound_cache
+    if cache and cache.path == full then return cache end
+    if cache then clear_sound_cache(true) end
+    local data = read_whole_file(full)
+    if not data then return nil end
+    STATE.sound_cache = { path = full, data = data }
+    return STATE.sound_cache
+end
+
 local function play_alert()
     if not CONFIG.sound_enabled then return end
     if winmm == nil then return end
-    if CONFIG.sound_file == "" then return end
-    local dir = (script_path():match("(.*[/\\])") or "") .. "notification sounds\\"
-    local full = dir .. CONFIG.sound_file
+    local cache = ensure_sound_cache()
+    if not cache then return end
     pcall(function()
-        local wpath = wide(full)
-        if not wpath then return end
-        winmm.PlaySoundW(wpath, nil, WIN.SND_FILENAME + WIN.SND_ASYNC + WIN.SND_NODEFAULT)
+        winmm.PlaySoundW(ffi.cast("LPCWSTR", cache.data), nil, WIN.SND_MEMORY + WIN.SND_ASYNC + WIN.SND_NODEFAULT)
     end)
 end
 
-local function enqueue_alert(title, body)
-    STATE.alert_queue[#STATE.alert_queue + 1] = {title = title or "", body = body or ""}
+local function enqueue_alert(title, body, meta)
+    STATE.alert_queue[#STATE.alert_queue + 1] = {title = title or "", body = body or "", meta = meta or ""}
 end
 
 local function apply_alpha(v)
@@ -760,6 +1142,7 @@ local function advance_queue()
     local item = table.remove(STATE.alert_queue, 1)
     STATE.heading_text = item.title
     STATE.body_text = item.body
+    STATE.meta_text = item.meta or ""
     STATE.alpha_value = 0
     STATE.alpha_ramp = 1
     STATE.popup_deadline = timestamp_ms() + CONFIG.duration * 1000
@@ -845,13 +1228,34 @@ local function body_saved_to(folder)
     return string.format(fmt, folder or "?")
 end
 
-local function enqueue_immediate(title, media_type, path)
-    local folder = root_folder_basename(media_type, path)
-    enqueue_alert(title, body_saved_to(folder))
+local function meta_for_media(media_type, path, nominal)
+    if media_type == "screenshot" then
+        return build_meta(path, nil, image_resolution(path))
+    elseif media_type == "replay" then
+        return build_meta(path, video_duration(path) or replay_max_duration() or nominal, nil)
+    elseif media_type == "clip_tr" or media_type == "clip_pr" then
+        return build_meta(path, video_duration(path) or nominal, nil)
+    end
+    return build_meta(path, video_duration(path), nil)
 end
 
-local function enqueue_pending(title, path)
-    STATE.pending[path] = { title = title }
+local function meta_for_final(pending, final_path)
+    if pending == nil then return "" end
+    return meta_for_media(pending.media_type, final_path, pending.nominal)
+end
+
+local function enqueue_pending(title, path, media_type, nominal)
+    STATE.pending[path] = { title = title, media_type = media_type, nominal = nominal }
+end
+
+local function pending_moved_target(ev)
+    if ev.status == 1 then
+        local dir = dirname(ev.path)
+        if dir and ev.info and ev.info ~= "" and basename(dir) ~= ev.info then
+            return dir .. "/" .. ev.info .. "/" .. basename(ev.path)
+        end
+    end
+    return ev.path
 end
 
 local function handle_obs_event(kind, path, media_type)
@@ -859,9 +1263,10 @@ local function handle_obs_event(kind, path, media_type)
     path = normalize_slashes(path)
     local sfo = sfo_status_read()
     if sfo.live and sfo.enabled then
-        enqueue_pending(kind, path)
+        enqueue_pending(kind, path, media_type, nil)
     else
-        enqueue_immediate(kind, media_type, path)
+        local folder = root_folder_basename(media_type, path)
+        enqueue_alert(kind, body_saved_to(folder), meta_for_media(media_type, path, nil))
     end
 end
 
@@ -889,8 +1294,8 @@ local function resolve_pending_if_sfo_down()
     local sfo = sfo_status_read()
     if sfo.live and sfo.enabled then return end
     for path, info in pairs(STATE.pending) do
-        local folder = root_folder_basename("replay", path)
-        enqueue_alert(info.title, body_saved_to(folder))
+        local folder = root_folder_basename(info.media_type or "replay", path)
+        enqueue_alert(info.title, body_saved_to(folder), meta_for_final(info, path))
     end
     STATE.pending = {}
 end
@@ -907,7 +1312,7 @@ local function process_sfo_moved_events()
             else
                 body = body_saved_to(ev.info ~= "" and ev.info or "OBS")
             end
-            enqueue_alert(pending.title, body)
+            enqueue_alert(pending.title, body, meta_for_final(pending, pending_moved_target(ev)))
             STATE.pending[key] = nil
         end
     end
@@ -924,10 +1329,10 @@ local function process_pr_notify_events()
         end
         local sfo = sfo_status_read()
         if sfo.live and sfo.enabled then
-            enqueue_pending(title, ev.path)
+            enqueue_pending(title, ev.path, "clip_pr", ev.duration)
         else
             local folder = root_folder_basename("replay", ev.path)
-            enqueue_alert(title, body_saved_to(folder))
+            enqueue_alert(title, body_saved_to(folder), meta_for_media("clip_pr", ev.path, ev.duration))
         end
     end
 end
@@ -938,11 +1343,20 @@ local function process_tr_notify_events()
         local title = title_for_clip(ev.duration)
         local sfo = sfo_status_read()
         if sfo.live and sfo.enabled then
-            enqueue_pending(title, ev.path)
+            enqueue_pending(title, ev.path, "clip_tr", ev.duration)
         else
             local folder = root_folder_basename("replay", ev.path)
-            enqueue_alert(title, body_saved_to(folder))
+            enqueue_alert(title, body_saved_to(folder), meta_for_media("clip_tr", ev.path, ev.duration))
         end
+    end
+end
+
+local function process_efc_notify_events()
+    local events = efc_notify_read_new()
+    for _, ev in ipairs(events) do
+        local title = getString("CompressionComplete")
+        local folder = basename(dirname(ev.path))
+        enqueue_alert(title, body_saved_to(folder), build_meta(ev.path, video_duration(ev.path), nil))
     end
 end
 
@@ -950,6 +1364,7 @@ local function read_settings(settings)
     if not settings then return end
     CONFIG.visual_enabled = obs.obs_data_get_bool(settings, "visual_enabled")
     CONFIG.sound_enabled = obs.obs_data_get_bool(settings, "sound_enabled")
+    CONFIG.show_meta_line = obs.obs_data_get_bool(settings, "show_meta_line")
     CONFIG.scale = math.floor(obs.obs_data_get_double(settings, "scale"))
     CONFIG.position = obs.obs_data_get_string(settings, "position")
     if CONFIG.position == "" then
@@ -975,7 +1390,11 @@ local function read_settings(settings)
 end
 
 local function preview_alert(props, p)
-    enqueue_alert(getString("TestTitle"), getString("TestBody"))
+    if CONFIG.show_meta_line then
+        enqueue_alert(getString("TestTitle"), getString("TestBody"), getString("AdditionalInfo"))
+    else
+        enqueue_alert(getString("TestTitle"), getString("TestBody"))
+    end
     return false
 end
 
@@ -987,6 +1406,7 @@ end
 function script_defaults(settings)
     obs.obs_data_set_default_bool(settings, "visual_enabled", true)
     obs.obs_data_set_default_bool(settings, "sound_enabled", true)
+    obs.obs_data_set_default_bool(settings, "show_meta_line", true)
     obs.obs_data_set_default_double(settings, "scale", 100.0)
     obs.obs_data_set_default_string(settings, "position", "top_right")
     obs.obs_data_set_default_double(settings, "duration", 3.0)
@@ -998,6 +1418,7 @@ function script_properties()
     local props = obs.obs_properties_create()
     local vis_group = obs.obs_properties_create()
     obs.obs_properties_add_bool(vis_group, "visual_enabled", getString("VisualEnabled"))
+    obs.obs_properties_add_bool(vis_group, "show_meta_line", getString("ShowMetaLine"))
     obs.obs_properties_add_float_slider(vis_group, "scale", getString("Scale"), 100, 300, 10)
     local pos = obs.obs_properties_add_list(vis_group, "position", getString("Position"), obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
     obs.obs_property_list_add_string(pos, getString("PosTopRight"), "top_right")
@@ -1027,6 +1448,7 @@ function script_load(settings)
     STATE.exiting = false
     STATE.sound_files = list_sound_files()
     read_settings(settings)
+    pcall(ensure_sound_cache)
     prepare_fonts()
     ensure_notification_class()
     pcall(function()
@@ -1045,6 +1467,7 @@ end
 function script_update(settings)
     STATE.sound_files = list_sound_files()
     read_settings(settings)
+    pcall(ensure_sound_cache)
     refresh_fonts()
     STATE.fonts_need_refresh = false
 end
@@ -1052,6 +1475,7 @@ end
 function script_save(settings)
     obs.obs_data_set_bool(settings, "visual_enabled", CONFIG.visual_enabled)
     obs.obs_data_set_bool(settings, "sound_enabled", CONFIG.sound_enabled)
+    obs.obs_data_set_bool(settings, "show_meta_line", CONFIG.show_meta_line)
     obs.obs_data_set_double(settings, "scale", CONFIG.scale)
     obs.obs_data_set_string(settings, "position", CONFIG.position)
     obs.obs_data_set_double(settings, "duration", CONFIG.duration)
@@ -1062,6 +1486,7 @@ function script_tick(seconds)
     if STATE.exiting then return end
     pcall(process_pr_notify_events)
     pcall(process_tr_notify_events)
+    pcall(process_efc_notify_events)
     pcall(process_sfo_moved_events)
     pcall(resolve_pending_if_sfo_down)
 end
@@ -1075,6 +1500,7 @@ function script_unload()
     pcall(destroy_memdc)
     if STATE.title_font then pcall(gdi32.DeleteObject, STATE.title_font) end
     if STATE.body_font then pcall(gdi32.DeleteObject, STATE.body_font) end
+    if STATE.meta_font then pcall(gdi32.DeleteObject, STATE.meta_font) end
     if default_loc then pcall(obs.obs_data_release, default_loc); default_loc = nil end
     if current_loc then pcall(obs.obs_data_release, current_loc); current_loc = nil end
     STATE.popup_hwnd = nil
@@ -1085,4 +1511,5 @@ function script_unload()
     STATE.pending = {}
     STATE.alert_queue = {}
     STATE.active_alert = nil
+    pcall(clear_sound_cache, true)
 end

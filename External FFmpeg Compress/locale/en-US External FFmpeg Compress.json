@@ -11,5 +11,6 @@
   "Resolution": "Resolution",
   "UseResolution": "Change resolution",
   "FPSValue": "Frames per second",
-  "UseFPS": "Change frames per second"
+  "UseFPS": "Change frames per second",
+  "OpenInExplorer": "Show file in explorer after compression          "
 }
