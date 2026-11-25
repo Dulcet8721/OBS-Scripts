@@ -12,8 +12,9 @@
 
 **Возможности:**
 - Сжатие видеофайлов кодирировщиком `x264`.
-- Настройка выходного разрешения и FPS. Настройка степени сжатия CRF. 
+- Настройка степени сжатия CRF, выходного разрешения и FPS. 
 - Поддержка аппаратного ускорения декодирования.
+- Интеграция с [Notifier](Notifier)
 
 [Подробное описание External FFmpeg Compress →](../../wiki/External-FFmpeg-Compress)
 
@@ -24,7 +25,7 @@
 **Возможности:**
 - Визуальные и звуковые уведомления сигнализирующие о сохранении файлов.
 - Настройка позиции, размера, длительности и звука уведомлений.
-- Интеграция с [Partial Replay](Partial-Replay) и [Smart File Organizer](Smart-File-Organizer).
+- Интеграция с [Partial Replay](Partial-Replay), [Trim Replay](Trim-Replay), [Smart File Organizer](Smart-File-Organizer) и [External FFmpeg Compress](External-FFmpeg-Compress).
 
 [Подробное описание Notifier →](../../wiki/Notifier)
 
@@ -48,7 +49,7 @@
 - Автоматическое создание папок с именами игр.
 - Автоматическая сортировка записей, повторов, скриншотов и частичных повторов по папкам.
 - Автоматическое разделение записи при смене фокуса с игры.
-- Интеграция с [Partial Replay](Partial-Replay) и [Notifier](Notifier).
+- Интеграция с [Partial Replay](Partial-Replay), [Trim Replay](Trim-Replay) и [Notifier](Notifier).
 
 [Подробное описание Smart File Organizer →](../../wiki/Smart-File-Organizer)
 
