@@ -11,10 +11,10 @@
 ### 💾 External FFmpeg Compress
 
 **Возможности:**
-- Сжатие видеофайлов кодирировщиком `x264`.
+- Сжатие видеофайлов кодировщиком `x264`.
 - Настройка степени сжатия CRF, выходного разрешения и FPS. 
 - Поддержка аппаратного ускорения декодирования.
-- Интеграция с [Notifier](Notifier)
+- Интеграция с [Notifier](../../wiki/Notifier)
 
 [Подробное описание External FFmpeg Compress →](../../wiki/External-FFmpeg-Compress)
 
@@ -25,7 +25,7 @@
 **Возможности:**
 - Визуальные и звуковые уведомления сигнализирующие о сохранении файлов.
 - Настройка позиции, размера, длительности и звука уведомлений.
-- Интеграция с [Partial Replay](Partial-Replay), [Trim Replay](Trim-Replay), [Smart File Organizer](Smart-File-Organizer) и [External FFmpeg Compress](External-FFmpeg-Compress).
+- Интеграция с [Partial Replay](../../wiki/Partial-Replay), [Trim Replay](../../wiki/Trim-Replay), [Smart File Organizer](../../wiki/Smart-File-Organizer) и [External FFmpeg Compress](../../wiki/External-FFmpeg-Compress).
 
 [Подробное описание Notifier →](../../wiki/Notifier)
 
@@ -35,9 +35,9 @@
 
 **Возможности:**
 - Создаёт до трёх дополнительных буферов повтора с настраиваемой длиной.
-- Отдельные горячие клавииши для сохранения каждого буфера.
+- Отдельные горячие клавиши для сохранения каждого буфера.
 - Сброс буферов после сохранения для предотвращения наложения.
-- Интеграция с [Smart File Organizer](Smart-File-Organizer) и [Notifier](Notifier).
+- Интеграция с [Smart File Organizer](../../wiki/Smart-File-Organizer) и [Notifier](../../wiki/Notifier).
 
 [Подробное описание Partial Replay →](../../wiki/Partial-Replay)
 
@@ -49,7 +49,7 @@
 - Автоматическое создание папок с именами игр.
 - Автоматическая сортировка записей, повторов, скриншотов и частичных повторов по папкам.
 - Автоматическое разделение записи при смене фокуса с игры.
-- Интеграция с [Partial Replay](Partial-Replay), [Trim Replay](Trim-Replay) и [Notifier](Notifier).
+- Интеграция с [Partial Replay](../../wiki/Partial-Replay), [Trim Replay](../../wiki/Trim-Replay) и [Notifier](../../wiki/Notifier).
 
 [Подробное описание Smart File Organizer →](../../wiki/Smart-File-Organizer)
 
@@ -75,13 +75,15 @@
 
 [Подробное описание Toggle OBS UI →](../../wiki/Toggle-OBS-UI)
 
+---
+
 ### 🎬 Trim Replay
 
 **Возможности:**
 - Позволяет сохранять клипы настраиваемой длины, которые являются частью основного буфера.
-- Отдельные горячие клавииши для сохранения клипов.
+- Отдельные горячие клавиши для сохранения клипов.
 - Обрезка файлов для предотвращения наложения.
-- Интеграция с [Smart File Organizer](Smart-File-Organizer) и [Notifier](Notifier).
+- Интеграция с [Smart File Organizer](../../wiki/Smart-File-Organizer) и [Notifier](../../wiki/Notifier).
 
 [Подробное описание Trim Replay →](../../wiki/Trim-Replay)
 
